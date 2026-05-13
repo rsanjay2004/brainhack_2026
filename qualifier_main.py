@@ -406,6 +406,37 @@ class QualifierMission:
             self._red_streak = 0
 
     # ------------------------------------------------------------------
+    # Sweep waypoint generation
+    # ------------------------------------------------------------------
+    def _build_zone_sweep(self, altitude, row_spacing):
+        down = -altitude
+        zones = [
+            (ZONE1_N, ZONE1_E),
+            (ZONE2_N, ZONE2_E),
+            (ZONE3_N, ZONE3_E),
+        ]
+        wps = []
+        for (n_lo, n_hi), (e_lo, e_hi) in zones:
+            n0 = self._origin_n + n_lo + WALL_MARGIN
+            n1 = self._origin_n + n_hi - WALL_MARGIN
+            e0 = self._origin_e + e_lo + WALL_MARGIN
+            e1 = self._origin_e + e_hi - WALL_MARGIN
+            if n1 <= n0 or e1 <= e0:
+                continue
+
+            east_cols = list(np.arange(e0, e1 + 1e-6, row_spacing))
+            base = len(wps)
+
+            for i, east in enumerate(east_cols):
+                east = max(e0, min(e1, east))
+                if (i + base) % 2 == 0:
+                    wps += [(n0, east, down), (n1, east, down)]
+                else:
+                    wps += [(n1, east, down), (n0, east, down)]
+
+        return wps
+
+    # ------------------------------------------------------------------
     # Waypoint management
     # ------------------------------------------------------------------
     def _current_wp(self):
