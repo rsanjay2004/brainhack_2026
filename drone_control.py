@@ -33,14 +33,15 @@ class Drone:
 
     async def _wait_armable(self, timeout=60.0):
         """
-        Stream health() until local position is valid (EKF ready).
+        Stream health() until PX4 reports the system is ready to arm.
+        Checks is_armable (PX4's composite pre-arm flag) first, then
+        falls back to is_local_position_ok for GNSS-denied configs where
+        is_armable may lag behind actual readiness.
         Returns True when ready, False on timeout.
-        Uses is_local_position_ok — correct for GNSS-denied indoor flight
-        where EKF origin is set manually via 'commander set_ekf_origin'.
         """
         async def _check():
             async for health in self.drone.telemetry.health():
-                if health.is_local_position_ok:
+                if health.is_armable or health.is_local_position_ok:
                     return
 
         try:
@@ -50,15 +51,48 @@ class Drone:
             return False
 
     async def arm_and_takeoff(self):
-        print("[DRONE] Waiting for EKF / local position to be ready...")
+        # ── Step 1: disarm if already armed from a previous crashed run ──
+        # PX4 returns COMMAND_DENIED if you try to arm an armed drone.
+        # A previous crash (bind error / zombie connection) leaves it armed.
+        try:
+            async for is_armed in self.drone.telemetry.armed():
+                if is_armed:
+                    print("[DRONE] Already armed (leftover from previous run) — disarming")
+                    try:
+                        await self.drone.action.disarm()
+                        await asyncio.sleep(2.0)
+                    except Exception as disarm_err:
+                        print(f"[DRONE] Disarm warning: {disarm_err}")
+                break
+        except Exception:
+            pass  # telemetry not yet ready — safe to continue
+
+        # ── Step 2: wait for EKF / pre-arm checks ────────────────────────
+        print("[DRONE] Waiting for EKF / pre-arm checks...")
         ready = await self._wait_armable(timeout=60.0)
         if not ready:
             raise RuntimeError(
-                "[DRONE] Timed out waiting for local position. "
+                "[DRONE] Timed out waiting for armable state. "
                 "Did you run: commander set_ekf_origin 47.397742 8.545594 488.0 ?"
             )
-        print("[DRONE] Local position OK — arming")
-        await self.drone.action.arm()
+        print("[DRONE] Pre-arm checks passed — arming")
+
+        # ── Step 3: arm with retry (transient MAVSDK timing can cause one-off denials)
+        last_exc = None
+        for attempt in range(3):
+            try:
+                await self.drone.action.arm()
+                last_exc = None
+                break
+            except Exception as e:
+                last_exc = e
+                if attempt < 2:
+                    print(f"[DRONE] Arm attempt {attempt + 1}/3 failed: {e} — retrying in 3s")
+                    await asyncio.sleep(3.0)
+        if last_exc:
+            raise last_exc
+
+        # ── Step 4: takeoff and enter offboard ────────────────────────────
         await self.drone.action.takeoff()
         await asyncio.sleep(20)
         print("Takeoff")

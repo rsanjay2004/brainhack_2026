@@ -463,9 +463,12 @@ class QualifierMission:
         return 0 <= ci < GRID_N_CELLS and 0 <= cj < GRID_E_CELLS
 
     def _ned_to_cell(self, north, east):
-        """Convert NED position to (row, col) grid indices."""
-        ci = int((north - self._origin_n - GRID_N_ORIGIN) / CELL_SIZE)
-        cj = int((east  - self._origin_e - GRID_E_ORIGIN) / CELL_SIZE)
+        """Convert NED position to (row, col) grid indices using floor division.
+        int() truncates toward zero so int(-0.25)=0 (wrong — outside grid).
+        Floor division gives int(-0.25//2.0)=-1 (correct — fails _valid_cell).
+        """
+        ci = int((north - self._origin_n - GRID_N_ORIGIN) // CELL_SIZE)
+        cj = int((east  - self._origin_e - GRID_E_ORIGIN) // CELL_SIZE)
         return ci, cj
 
     def _cell_to_ned(self, ci, cj):
