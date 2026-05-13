@@ -83,6 +83,7 @@ class Drone:
             try:
                 await self.drone.action.arm()
                 last_exc = None
+                print(f"[DRONE] Arm attempt {attempt + 1}/3 succeeded")
                 break
             except Exception as e:
                 last_exc = e
@@ -90,7 +91,13 @@ class Drone:
                     print(f"[DRONE] Arm attempt {attempt + 1}/3 failed: {e} — retrying in 3s")
                     await asyncio.sleep(3.0)
         if last_exc:
-            raise last_exc
+            async for is_armed in self.drone.telemetry.armed():
+                if is_armed:
+                    print("[DRONE] Arm ACK was lost but drone IS armed — proceeding")
+                    last_exc = None
+                break
+            if last_exc:
+                raise last_exc
 
         # ── Step 4: takeoff and enter offboard ────────────────────────────
         await self.drone.action.takeoff()

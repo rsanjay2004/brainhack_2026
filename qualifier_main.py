@@ -368,7 +368,9 @@ class QualifierMission:
             print(f"[FSM] Takeoff failed: {e}")
             print("[FSM] TAKEOFF → LAND (aborting safely)")
             self._state = MissionState.LAND
-            await self.drone.land()
+            if self.state.is_armed:
+                await self.drone.land()
+                self.state.is_armed = False
             return
 
         monitor = asyncio.create_task(
