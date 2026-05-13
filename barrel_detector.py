@@ -94,7 +94,7 @@ class BarrelDetector:
             )
             self._worker_thread.start()
 
-    self._node.subscribe(Image, topic, self._on_image)
+        self._node.subscribe(Image, topic, self._on_image)
 
     def _on_image(self, msg: Image) -> None:
         frame = np.frombuffer(msg.data, dtype=np.uint8).reshape((msg.height, msg.width, 3))
