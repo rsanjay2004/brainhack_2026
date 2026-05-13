@@ -1,5 +1,7 @@
+# drone_control.py
+
 from mavsdk import System
-from mavsdk.offboard import Offboard
+# from mavsdk.offboard import Offboard
 from mavsdk.offboard import VelocityNedYaw, PositionNedYaw
 import asyncio
 import math
@@ -31,10 +33,10 @@ class Drone:
                 print("Connected")
                 break
 
-    async def _wait_armable(self, timeout=90.0, stable_samples=15):
+    async def _wait_armable(self, timeout=90.0, stable_samples=8):
         """
-        Indoor/GNSS-denied readiness gate.
-        Wait for stable local-position readiness or a true armable state.
+        Wait for PX4's composite armable flag to be stably true.
+        Do not use is_local_position_ok as an arm gate.
         """
         consecutive = 0
 
@@ -42,9 +44,6 @@ class Drone:
             nonlocal consecutive
             async for health in self.drone.telemetry.health():
                 if health.is_armable:
-                    return
-
-                if health.is_local_position_ok:
                     consecutive += 1
                     if consecutive >= stable_samples:
                         return
@@ -57,35 +56,25 @@ class Drone:
         except asyncio.TimeoutError:
             return False
 
-    async def arm_and_takeoff(self):
-        # ── Step 1: disarm if already armed from a previous crashed run ──
-        # PX4 returns COMMAND_DENIED if you try to arm an armed drone.
-        # A previous crash (bind error / zombie connection) leaves it armed.
-        try:
-            async for is_armed in self.drone.telemetry.armed():
-                if is_armed:
-                    print("[DRONE] Already armed (leftover from previous run) — disarming")
-                    try:
-                        await self.drone.action.disarm()
-                        await asyncio.sleep(2.0)
-                    except Exception as disarm_err:
-                        print(f"[DRONE] Disarm warning: {disarm_err}")
-                break
-        except Exception:
-            pass  # telemetry not yet ready — safe to continue
+    async def _is_armed_once(self):
+        async for is_armed in self.drone.telemetry.armed():
+            return bool(is_armed)
+        return False
 
-        # ── Step 2: wait for EKF / pre-arm checks ────────────────────────
+    async def arm_and_takeoff(self):
+        # Step 1: wait for EKF / pre-arm checks
         print("[DRONE] Waiting for EKF / pre-arm checks...")
-        ready = await self._wait_armable(timeout=90.0)
+        ready = await self._wait_armable(timeout=90.0, stable_samples=8)
         if not ready:
             raise RuntimeError(
-                "[DRONE] Timed out waiting for armable state. "
+                "[DRONE] Timed out waiting for stable armable state. "
                 "Did you run: commander set_ekf_origin 47.397742 8.545594 488.0 ?"
             )
+
         print("[DRONE] Pre-arm checks passed — arming")
         await asyncio.sleep(2.0)
 
-        # ── Step 3: arm with retry (transient MAVSDK timing can cause one-off denials)
+        # Step 2: arm with retry
         last_exc = None
         for attempt in range(3):
             try:
@@ -98,22 +87,23 @@ class Drone:
                 if attempt < 2:
                     print(f"[DRONE] Arm attempt {attempt + 1}/3 failed: {e} — retrying in 3s")
                     await asyncio.sleep(3.0)
+
+        # Step 3: lost-ACK check
         if last_exc:
-            async for is_armed in self.drone.telemetry.armed():
-                if is_armed:
-                    print("[DRONE] Arm ACK was lost but drone IS armed — proceeding")
-                    last_exc = None
-                break
-            if last_exc:
+            armed = await self._is_armed_once()
+            if armed:
+                print("[DRONE] Arm ACK was lost but drone is armed — proceeding")
+            else:
                 raise last_exc
 
-        # ── Step 4: takeoff and enter offboard ────────────────────────────
+        # Step 4: takeoff and enter offboard
         await self.drone.action.takeoff()
         await asyncio.sleep(20)
         print("Takeoff")
-        # Required before offboard start
-        await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, 0.0))
-        # Start offboard mode
+
+        await self.drone.offboard.set_velocity_ned(
+            VelocityNedYaw(0.0, 0.0, 0.0, 0.0)
+        )
         await self.drone.offboard.start()
 
     async def land(self):
