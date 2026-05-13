@@ -1,3 +1,5 @@
+# barrel_detector.py
+
 import math
 import os
 import threading
