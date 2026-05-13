@@ -185,7 +185,7 @@ class QualifierMission:
     # ------------------------------------------------------------------
 
     def _pose(self):
-        if self.state.latest_position is None or sel.state.latest_yaw is None:
+        if self.state.latest_position is None or self.state.latest_yaw is None:
             return None
 
 
