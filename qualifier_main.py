@@ -2,6 +2,7 @@ import asyncio
 import math
 import sys
 import time
+from enum import Enum
 
 import numpy as np
 
@@ -36,9 +37,6 @@ ALT_YELLOW = 1.8    # low — ground-level yellow barrels visible in lower frame
 ALT_RED    = 4.5    # high — elevated red barrels come into camera FOV
 
 # Lawnmower row spacing
-# Camera horiz FOV ~72° → swath ~2*alt*tan(36°)
-# 1.8 m alt → ~2.6 m swath; 3.0 m rows give ~15% overlap
-# 4.5 m alt → ~6.5 m swath; 5.0 m rows give ~25% overlap
 ROW_SPACING_LOW  = 3.0
 ROW_SPACING_HIGH = 5.0
 
@@ -48,7 +46,7 @@ ARRIVAL_ALT    = 0.5   # vertical arrival threshold (m)
 MISSION_LIMIT  = 600.0 # s — 10 min hard cap
 
 # Virtual target blending
-LOOK_AHEAD  = 1.5  # m — smaller = tighter path following
+LOOK_AHEAD  = 1.5  # m
 W_AVOID     = 0.5  # depth-camera avoidance weight
 W_MEM_AVOID = 0.3  # memory map avoidance weight
 
@@ -57,25 +55,47 @@ SAFE_DIST = 3.0
 CRIT_DIST = 1.5
 
 # Map memory
-MAP_RETENTION_M  = 15.0  # prune obstacles beyond this radius (m)
-MAP_INFLUENCE_M  = 4.5   # repulsion influence radius (m)
-MAP_Z_MAX        = 10.0  # max depth to trust in mapper (m)
+MAP_RETENTION_M  = 15.0
+MAP_INFLUENCE_M  = 4.5
+MAP_Z_MAX        = 10.0
 
 # Stuck detection
 STUCK_TIMEOUT_S = 10.0
 STUCK_DIST_M    = 0.4
 STUCK_ESCAPE_M  = 2.5
 
-# Detection confirmation: barrel must appear in this many consecutive frames
+# Detection confirmation
 DETECT_CONFIRM = 2
 
 MERGE_DIST = 3.0
+
+# Stabilize sensor gate
+STABILIZE_TIMEOUT = 30.0  # s — abort if sensors not valid within this window
 
 CAM_K = np.array([[433.0, 0.0, 320.0],
                   [0.0,   433.0, 240.0],
                   [0.0,   0.0,   1.0]])
 
 
+# ---------------------------------------------------------------------------
+# Mission state machine
+# ---------------------------------------------------------------------------
+class MissionState(Enum):
+    INIT         = "INIT"
+    CONNECT      = "CONNECT"
+    TAKEOFF      = "TAKEOFF"
+    STABILIZE    = "STABILIZE"
+    STARTUP_SCAN = "STARTUP_SCAN"
+    EXPLORE      = "EXPLORE"
+    SCAN         = "SCAN"     # stub — full logic added in Part 2
+    ESCAPE       = "ESCAPE"
+    DONE         = "DONE"
+    LAND         = "LAND"
+
+
+# ---------------------------------------------------------------------------
+# Mission
+# ---------------------------------------------------------------------------
 class QualifierMission:
 
     def __init__(self, model_path=""):
@@ -101,12 +121,16 @@ class QualifierMission:
             yaw_smoothing=0.8,
         )
 
+        # State machine — _state controls what the drone is doing.
+        # _phase controls which altitude pass (YELLOW / RED), kept separate.
+        self._state  = MissionState.INIT
+        self._phase  = "YELLOW"
+
         self._start_time = None
         self._waypoints  = []
         self._wp_idx     = 0
-        self._phase      = "YELLOW"
 
-        # NED origin recorded at takeoff — arena is offset from here
+        # NED origin recorded at takeoff
         self._origin_n = 0.0
         self._origin_e = 0.0
 
@@ -115,7 +139,7 @@ class QualifierMission:
         self._stuck_ref_n = 0.0
         self._stuck_ref_e = 0.0
 
-        # Consecutive detection counters
+        # Consecutive detection streak counters
         self._yellow_streak = 0
         self._red_streak    = 0
 
@@ -129,7 +153,7 @@ class QualifierMission:
         return max(0.0, MISSION_LIMIT - self._elapsed())
 
     # ------------------------------------------------------------------
-    # Pose
+    # Pose snapshot
     # ------------------------------------------------------------------
     def _pose(self):
         if self.state.latest_position is None:
@@ -144,10 +168,7 @@ class QualifierMission:
         }
 
     # ------------------------------------------------------------------
-    # Arena boundary helpers — L-shaped arena aware
-    # All setpoints MUST be clamped through here before being sent.
-    # Offsets from initial spawn NED so the sweep works regardless of
-    # where in the world the drone spawns.
+    # Arena boundary helpers
     # ------------------------------------------------------------------
     @property
     def _n_min(self): return self._origin_n + ZONE1_N[0] + WALL_MARGIN
@@ -168,9 +189,7 @@ class QualifierMission:
     def _clamp(self, n, e):
         n = max(self._n_min, min(self._n_max, n))
         e = max(self._e_min, min(self._e_max, e))
-        # If clamped into the forbidden cutout, nudge toward nearest safe arm
         if self._in_forbidden(n, e):
-            # Push east toward zone 3 or west toward zone 2
             mid_e = self._origin_e + (FORBIDDEN_E[0] + FORBIDDEN_E[1]) / 2.0
             if e >= mid_e:
                 e = self._origin_e + ZONE3_E[0] + WALL_MARGIN
@@ -187,7 +206,7 @@ class QualifierMission:
         return out_of_bounds or self._in_forbidden(n, e, margin=m)
 
     # ------------------------------------------------------------------
-    # Sweep waypoint generation — covers all three L-shaped zones
+    # Sweep waypoint generation
     # ------------------------------------------------------------------
     def _build_zone_sweep(self, altitude, row_spacing):
         down  = -altitude
@@ -215,7 +234,7 @@ class QualifierMission:
         return wps
 
     # ------------------------------------------------------------------
-    # Startup 360° scan — rotate in place (position-locked) and seed map
+    # Startup 360° scan — rotate in place and seed GlobalMapper
     # ------------------------------------------------------------------
     async def _startup_scan(self):
         p = self._pose()
@@ -224,15 +243,13 @@ class QualifierMission:
 
         for yaw in [0, 45, 90, 135, 180, 225, 270, 315]:
             await self.drone.rotate_to_yaw(float(yaw))
-            await asyncio.sleep(1.2)   # let frame settle after rotation stops
+            await asyncio.sleep(1.2)
             depth = self.depth_rx.get_frame()
             pose  = self._pose()
             if depth is not None:
                 self.mapper.update_frame(depth, pose)
-            # Keep position locked throughout the dwell
             await self.drone.send_position_setpoint(hold_n, hold_e, hold_d, float(yaw))
 
-        # Return to north-facing heading
         await self.drone.rotate_to_yaw(0.0)
         await asyncio.sleep(0.5)
         pts = self.mapper.get_global_points()
@@ -303,7 +320,7 @@ class QualifierMission:
                   f"N={wp[0]:.1f} E={wp[1]:.1f} Alt={-wp[2]:.1f}m")
 
     # ------------------------------------------------------------------
-    # Stuck detection — resets automatically when progress is made
+    # Stuck detection
     # ------------------------------------------------------------------
     def _reset_stuck(self):
         p = self._pose()
@@ -316,7 +333,6 @@ class QualifierMission:
         moved = math.hypot(p["north"] - self._stuck_ref_n,
                            p["east"]  - self._stuck_ref_e)
         if moved >= STUCK_DIST_M:
-            # Made progress — slide the reference window forward
             self._stuck_ref_n = p["north"]
             self._stuck_ref_e = p["east"]
             self._stuck_timer = time.monotonic()
@@ -325,17 +341,16 @@ class QualifierMission:
 
     async def _escape_stuck(self):
         p = self._pose()
-        print(f"[STUCK] at N={p['north']:.1f} E={p['east']:.1f} — trying escape directions")
+        print(f"[ESCAPE] at N={p['north']:.1f} E={p['east']:.1f} — trying escape directions")
         wp = self._current_wp()
 
-        # Try 4 escape angles; pick first that keeps drone in bounds
         for delta in [90, -90, 180, 45]:
             yaw = (p["yaw_deg"] + delta) % 360.0
             cn  = p["north"] + STUCK_ESCAPE_M * math.cos(math.radians(yaw))
             ce  = p["east"]  + STUCK_ESCAPE_M * math.sin(math.radians(yaw))
             cn, ce = self._clamp(cn, ce)
             if not self._is_near_wall(cn, ce):
-                print(f"[STUCK] escaping → yaw={yaw:.0f}°")
+                print(f"[ESCAPE] escaping → yaw={yaw:.0f}°")
                 alt_d = wp[2] if wp else p["down"]
                 await self.drone.rotate_to_yaw(yaw)
                 await self.drone.send_position_setpoint(cn, ce, alt_d, yaw)
@@ -345,12 +360,12 @@ class QualifierMission:
         self._reset_stuck()
 
     # ------------------------------------------------------------------
-    # Virtual target: goal + avoidance blend, clamped to arena
+    # Virtual target blending — goal + avoidance + memory
     # ------------------------------------------------------------------
     def _compute_setpoint(self, pose, target_n, target_e, target_d, depth):
         cur_n, cur_e = pose["north"], pose["east"]
 
-        # Emergency: drone is outside/near wall or in forbidden zone — push to zone 1 centre
+        # Emergency: near wall/forbidden — push to zone 1 centre
         if self._is_near_wall(cur_n, cur_e, extra=0.5):
             safe_n = self._origin_n + (ZONE1_N[0] + ZONE1_N[1]) / 2.0
             safe_e = self._origin_e + (ZONE1_E[0] + ZONE1_E[1]) / 2.0
@@ -381,10 +396,10 @@ class QualifierMission:
                 print(f"[AVOID] L={cl['left']:.1f} C={cl['center']:.1f} "
                       f"R={cl['right']:.1f}")
 
-        # Memory-map repulsion — obstacles remembered from past frames
+        # Memory-map repulsion from GlobalMapper
         mem_n, mem_e = self.mapper.get_repulsion_vector(cur_n, cur_e, MAP_INFLUENCE_M)
 
-        # Blend goal + depth avoidance + memory avoidance
+        # Blend: goal + avoidance + memory (goal suppressed when fully blocked)
         if blocked:
             blend_n = avoid_n + W_MEM_AVOID * mem_n
             blend_e = avoid_e + W_MEM_AVOID * mem_e
@@ -399,7 +414,6 @@ class QualifierMission:
         else:
             blend_n, blend_e = goal_n, goal_e
 
-        # Project virtual target, then clamp — prevents flying outside arena
         raw_n = cur_n + LOOK_AHEAD * blend_n
         raw_e = cur_e + LOOK_AHEAD * blend_e
         send_n, send_e = self._clamp(raw_n, raw_e)
@@ -408,80 +422,134 @@ class QualifierMission:
         return send_n, send_e, target_d, yaw_deg
 
     # ------------------------------------------------------------------
-    # 20 Hz control loop
+    # STABILIZE: block until pose + yaw + depth are all valid
+    # ------------------------------------------------------------------
+    async def _wait_stabilize(self):
+        print(f"[STABILIZE] Waiting for pose, yaw, and depth frame "
+              f"(timeout={STABILIZE_TIMEOUT:.0f}s)...")
+        t0 = time.monotonic()
+        while True:
+            pose_ok  = self.state.latest_position is not None
+            yaw_ok   = self.state.latest_yaw is not None
+            depth_ok = self.depth_rx.get_frame() is not None
+
+            if pose_ok and yaw_ok and depth_ok:
+                print("[STABILIZE] All sensors valid — proceeding.")
+                return True
+
+            elapsed = time.monotonic() - t0
+            if elapsed > STABILIZE_TIMEOUT:
+                print(f"[STABILIZE] Timeout after {STABILIZE_TIMEOUT:.0f}s — "
+                      f"pose={'ok' if pose_ok else 'MISSING'}  "
+                      f"yaw={'ok' if yaw_ok else 'MISSING'}  "
+                      f"depth={'ok' if depth_ok else 'MISSING'}")
+                return False
+
+            await asyncio.sleep(0.1)
+
+    # ------------------------------------------------------------------
+    # State tick: EXPLORE
+    # ------------------------------------------------------------------
+    async def _tick_explore(self):
+        if self._time_left() < 10.0:
+            print("[MISSION] Time limit reached.")
+            self._state = MissionState.DONE
+            return
+
+        self._run_detection()
+
+        wp = self._current_wp()
+        if wp is None:
+            if self._phase == "YELLOW":
+                print(f"\n[PHASE 1 DONE] {self.tracker.summary()}")
+                if self._time_left() > 90:
+                    self._start_phase("RED")
+                else:
+                    print("[MISSION] Not enough time for red sweep.")
+                    self._state = MissionState.DONE
+            else:
+                print(f"\n[PHASE 2 DONE] {self.tracker.summary()}")
+                self._state = MissionState.DONE
+            return
+
+        pose  = self._pose()
+        cur_n = pose["north"]
+        cur_e = pose["east"]
+
+        # Emergency boundary recovery
+        if self._is_near_wall(cur_n, cur_e, extra=0.5):
+            safe_n = self._origin_n + (ZONE1_N[0] + ZONE1_N[1]) / 2.0
+            safe_e = self._origin_e + (ZONE1_E[0] + ZONE1_E[1]) / 2.0
+            await self.drone.send_position_setpoint(safe_n, safe_e, wp[2], 0.0)
+            return
+
+        if self._arrived(wp):
+            self._advance_wp()
+            return
+
+        if self._check_stuck():
+            print(f"[FSM] Stuck detected → EXPLORE → ESCAPE")
+            self._state = MissionState.ESCAPE
+            return
+
+        target_n, target_e, target_d = wp
+        depth = self.depth_rx.get_frame()
+
+        if depth is not None:
+            self.mapper.update_frame(depth, pose)
+            self.mapper.prune(pose["north"], pose["east"], MAP_RETENTION_M)
+
+        send_n, send_e, send_d, yaw_deg = self._compute_setpoint(
+            pose, target_n, target_e, target_d, depth
+        )
+        await self.drone.send_position_setpoint(
+            north=send_n, east=send_e, down=send_d, yaw_deg=yaw_deg
+        )
+
+    # ------------------------------------------------------------------
+    # State tick: SCAN (stub — Part 2 adds visited-grid trigger)
+    # ------------------------------------------------------------------
+    async def _tick_scan(self):
+        print("[FSM] SCAN — stub: running 360° scan then returning to EXPLORE")
+        await self._startup_scan()
+        self._state = MissionState.EXPLORE
+
+    # ------------------------------------------------------------------
+    # State tick: ESCAPE
+    # ------------------------------------------------------------------
+    async def _tick_escape(self):
+        await self._escape_stuck()
+        print("[FSM] ESCAPE → EXPLORE")
+        self._state = MissionState.EXPLORE
+
+    # ------------------------------------------------------------------
+    # Dispatch-table control loop
     # ------------------------------------------------------------------
     async def _control_loop(self):
         dt = 1.0 / CONTROL_HZ
-        await self._startup_scan()
-        self._start_phase("YELLOW")
 
-        while True:
+        _dispatch = {
+            MissionState.EXPLORE: self._tick_explore,
+            MissionState.SCAN:    self._tick_scan,
+            MissionState.ESCAPE:  self._tick_escape,
+        }
+
+        print(f"[FSM] Control loop started — state: {self._state.value}")
+
+        while self._state not in (MissionState.DONE, MissionState.LAND):
             t0 = time.monotonic()
 
-            if self._time_left() < 10.0:
-                print("[MISSION] Time limit reached.")
-                break
-
-            self._run_detection()
-
-            wp = self._current_wp()
-            if wp is None:
-                if self._phase == "YELLOW":
-                    print(f"\n[PHASE 1 DONE] {self.tracker.summary()}")
-                    if self._time_left() > 90:
-                        self._start_phase("RED")
-                        wp = self._current_wp()
-                    else:
-                        print("[MISSION] Not enough time for red sweep.")
-                        break
-                else:
-                    print(f"\n[PHASE 2 DONE] {self.tracker.summary()}")
-                    break
-            if wp is None:
-                break
-
-            pose  = self._pose()
-            cur_n = pose["north"]
-            cur_e = pose["east"]
-
-            # Emergency boundary recovery — push to centre of zone 1 (always safe)
-            if self._is_near_wall(cur_n, cur_e, extra=0.5):
-                safe_n = self._origin_n + (ZONE1_N[0] + ZONE1_N[1]) / 2.0
-                safe_e = self._origin_e + (ZONE1_E[0] + ZONE1_E[1]) / 2.0
-                await self.drone.send_position_setpoint(safe_n, safe_e, wp[2], 0.0)
-                await asyncio.sleep(0.05)
-                continue
-
-            if self._arrived(wp):
-                self._advance_wp()
-                wp = self._current_wp()
-                if wp is None:
-                    continue
-
-            if self._check_stuck():
-                await self._escape_stuck()
-                await asyncio.sleep(0)
-                continue
-
-            target_n, target_e, target_d = wp
-            depth = self.depth_rx.get_frame()
-
-            # Feed depth into sliding-window map
-            if depth is not None:
-                self.mapper.update_frame(depth, pose)
-                self.mapper.prune(pose["north"], pose["east"], MAP_RETENTION_M)
-
-            send_n, send_e, send_d, yaw_deg = self._compute_setpoint(
-                pose, target_n, target_e, target_d, depth
-            )
-
-            await self.drone.send_position_setpoint(
-                north=send_n, east=send_e, down=send_d, yaw_deg=yaw_deg
-            )
+            handler = _dispatch.get(self._state)
+            if handler is not None:
+                await handler()
+            else:
+                print(f"[FSM] No handler for state {self._state.value} — idling one tick")
 
             sleep_t = dt - (time.monotonic() - t0)
             if sleep_t > 0:
                 await asyncio.sleep(sleep_t)
+
+        print(f"[FSM] Control loop exited — final state: {self._state.value}")
 
     # ------------------------------------------------------------------
     # Entry point
@@ -495,6 +563,9 @@ class QualifierMission:
         print("  2) In PX4 terminal: commander set_ekf_origin 47.397742 8.545594 488.0")
         print("  3) Then run this script\n")
 
+        # ── CONNECT ──────────────────────────────────────────────────
+        self._state = MissionState.CONNECT
+        print(f"[FSM] {self._state.value}")
         await self.drone.connect()
         print("[INIT] Connected")
         await asyncio.sleep(3)
@@ -502,12 +573,14 @@ class QualifierMission:
         monitor = asyncio.create_task(
             position_monitor_task(self.drone, self.state, self.stop_evt)
         )
-        await asyncio.sleep(2)
 
+        # ── TAKEOFF ──────────────────────────────────────────────────
+        self._state = MissionState.TAKEOFF
+        print(f"[FSM] {self._state.value}")
+        await asyncio.sleep(2)
         print("[INIT] Arming and taking off...")
         await self.drone.arm_and_takeoff()
 
-        # Record NED spawn position — all waypoints offset from here
         p = self._pose()
         self._origin_n = p["north"]
         self._origin_e = p["east"]
@@ -522,9 +595,33 @@ class QualifierMission:
               f"N [{self._origin_n+ZONE3_N[0]:.1f} → {self._origin_n+ZONE3_N[1]:.1f}]  "
               f"E [{self._origin_e+ZONE3_E[0]:.1f} → {self._origin_e+ZONE3_E[1]:.1f}]")
 
+        # ── STABILIZE ────────────────────────────────────────────────
+        self._state = MissionState.STABILIZE
+        print(f"[FSM] {self._state.value}")
+        sensors_ok = await self._wait_stabilize()
+        if not sensors_ok:
+            print("[FSM] Sensor gate failed — aborting mission safely.")
+            self._state = MissionState.LAND
+            self.stop_evt.set()
+            monitor.cancel()
+            try:
+                await monitor
+            except asyncio.CancelledError:
+                pass
+            await self.drone.land()
+            return
+
+        # ── STARTUP_SCAN ─────────────────────────────────────────────
+        self._state = MissionState.STARTUP_SCAN
+        print(f"[FSM] {self._state.value}")
+        await self._startup_scan()
+
+        # ── EXPLORE ──────────────────────────────────────────────────
+        self._start_phase("YELLOW")
         self._start_time = time.monotonic()
         self._reset_stuck()
-        print("[START] Airborne — 10:00 countdown\n")
+        self._state = MissionState.EXPLORE
+        print(f"[FSM] {self._state.value} — 10:00 countdown started\n")
 
         try:
             await self._control_loop()
@@ -549,6 +646,8 @@ class QualifierMission:
                   f"{self.tracker.red_count * 100} pts")
             print(f"  Total   : {self.tracker.score()} pts")
             print("=" * 50)
+            self._state = MissionState.LAND
+            print(f"[FSM] {self._state.value}")
             print("[LAND] Landing...")
             await self.drone.land()
             print("[DONE]")
@@ -575,5 +674,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-# Test push from Claude - Wed May 13 07:38:15 UTC 2026
