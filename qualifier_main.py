@@ -69,6 +69,13 @@ DETECT_CONFIRM = 2
 
 MERGE_DIST = 3.0
 
+# Visited grid
+CELL_SIZE     = 2.0          # m — grid cell resolution
+GRID_N_ORIGIN = ZONE1_N[0]  # -4.0  m — south edge relative to spawn NED
+GRID_E_ORIGIN = ZONE1_E[0]  # -12.0 m — west  edge relative to spawn NED
+GRID_N_CELLS  = 18           # ceil((ZONE2_N[1] - ZONE1_N[0]) / CELL_SIZE) = 36/2
+GRID_E_CELLS  = 20           # ceil((ZONE3_E[1] - ZONE1_E[0]) / CELL_SIZE) = 40/2
+
 # Stabilize sensor gate
 STABILIZE_TIMEOUT = 30.0  # s — abort if sensors not valid within this window
 
@@ -91,6 +98,19 @@ class MissionState(Enum):
     ESCAPE       = "ESCAPE"
     DONE         = "DONE"
     LAND         = "LAND"
+
+
+# ---------------------------------------------------------------------------
+# Visited grid cell
+# ---------------------------------------------------------------------------
+class GridCell:
+    __slots__ = ("visited_count", "last_visit_time", "scan_done", "blocked")
+
+    def __init__(self):
+        self.visited_count   = 0
+        self.last_visit_time = 0.0
+        self.scan_done       = False
+        self.blocked         = False   # permanently out of arena — never a target
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +162,10 @@ class QualifierMission:
         # Consecutive detection streak counters
         self._yellow_streak = 0
         self._red_streak    = 0
+
+        # Visited grid — built after takeoff origin is recorded
+        self._grid      = None       # GridCell[GRID_N_CELLS][GRID_E_CELLS]
+        self._last_cell = (-1, -1)   # previous cell index, for entry detection
 
     # ------------------------------------------------------------------
     # Time
@@ -298,7 +322,8 @@ class QualifierMission:
         if wp:
             print(f"[NAV] WP {self._wp_idx}/{len(self._waypoints)}  "
                   f"N={wp[0]:.1f} E={wp[1]:.1f} Alt={-wp[2]:.1f}m  "
-                  f"T={self._time_left():.0f}s  {self.tracker.summary()}")
+                  f"T={self._time_left():.0f}s  {self.tracker.summary()}  "
+                  f"{self._coverage_summary()}")
 
     def _start_phase(self, phase):
         self._phase = phase
@@ -422,6 +447,98 @@ class QualifierMission:
         return send_n, send_e, target_d, yaw_deg
 
     # ------------------------------------------------------------------
+    # Visited grid — 2m cells covering the full L-shaped arena
+    # ------------------------------------------------------------------
+    def _in_arena(self, n, e):
+        """True if NED point is inside one of the three valid flight zones."""
+        in_z1 = (self._origin_n + ZONE1_N[0] <= n <= self._origin_n + ZONE1_N[1] and
+                  self._origin_e + ZONE1_E[0] <= e <= self._origin_e + ZONE1_E[1])
+        in_z2 = (self._origin_n + ZONE2_N[0] <= n <= self._origin_n + ZONE2_N[1] and
+                  self._origin_e + ZONE2_E[0] <= e <= self._origin_e + ZONE2_E[1])
+        in_z3 = (self._origin_n + ZONE3_N[0] <= n <= self._origin_n + ZONE3_N[1] and
+                  self._origin_e + ZONE3_E[0] <= e <= self._origin_e + ZONE3_E[1])
+        return in_z1 or in_z2 or in_z3
+
+    def _valid_cell(self, ci, cj):
+        return 0 <= ci < GRID_N_CELLS and 0 <= cj < GRID_E_CELLS
+
+    def _ned_to_cell(self, north, east):
+        """Convert NED position to (row, col) grid indices."""
+        ci = int((north - self._origin_n - GRID_N_ORIGIN) / CELL_SIZE)
+        cj = int((east  - self._origin_e - GRID_E_ORIGIN) / CELL_SIZE)
+        return ci, cj
+
+    def _cell_to_ned(self, ci, cj):
+        """Return NED centre coordinates of cell (ci, cj)."""
+        north = self._origin_n + GRID_N_ORIGIN + (ci + 0.5) * CELL_SIZE
+        east  = self._origin_e + GRID_E_ORIGIN + (cj + 0.5) * CELL_SIZE
+        return north, east
+
+    def _init_grid(self):
+        """
+        Build the visited grid after spawn NED origin is known.
+        Cells outside the L-shaped arena are pre-marked blocked so the
+        exploration logic never targets them.
+        """
+        self._grid = [[GridCell() for _ in range(GRID_E_CELLS)]
+                      for _ in range(GRID_N_CELLS)]
+        blocked = 0
+        for ci in range(GRID_N_CELLS):
+            for cj in range(GRID_E_CELLS):
+                cn, ce = self._cell_to_ned(ci, cj)
+                if not self._in_arena(cn, ce):
+                    self._grid[ci][cj].blocked   = True
+                    self._grid[ci][cj].scan_done = True
+                    blocked += 1
+        navigable = GRID_N_CELLS * GRID_E_CELLS - blocked
+        print(f"[GRID] {GRID_N_CELLS}×{GRID_E_CELLS} grid  "
+              f"cell={CELL_SIZE}m  navigable={navigable}  blocked={blocked}")
+
+    def _update_grid(self, pose):
+        """
+        Called every EXPLORE tick. Marks the current cell visited.
+        Returns True if a SCAN should be triggered:
+          - first entry into this cell, AND
+          - detector has an active streak (barrel may be nearby).
+        """
+        if self._grid is None:
+            return False
+        ci, cj = self._ned_to_cell(pose["north"], pose["east"])
+        if not self._valid_cell(ci, cj):
+            return False
+        cell = self._grid[ci][cj]
+        if cell.blocked:
+            return False
+
+        prev_cell       = self._last_cell
+        self._last_cell = (ci, cj)
+
+        first_entry           = (prev_cell != (ci, cj)) and (cell.visited_count == 0)
+        cell.visited_count   += 1
+        cell.last_visit_time  = time.monotonic()
+
+        if first_entry and not cell.scan_done:
+            if self._yellow_streak > 0 or self._red_streak > 0:
+                print(f"[GRID] New cell ({ci},{cj}) + streak "
+                      f"Y={self._yellow_streak} R={self._red_streak} → SCAN")
+                return True
+        return False
+
+    def _coverage_summary(self):
+        """Short string showing how many navigable cells have been visited."""
+        if self._grid is None:
+            return "grid=uninit"
+        navigable = visited = 0
+        for row in self._grid:
+            for cell in row:
+                if not cell.blocked:
+                    navigable += 1
+                    if cell.visited_count > 0:
+                        visited += 1
+        pct = int(100 * visited / navigable) if navigable else 0
+        return f"grid={visited}/{navigable}({pct}%)"
+
+    # ------------------------------------------------------------------
     # STABILIZE: block until pose + yaw + depth are all valid
     # ------------------------------------------------------------------
     async def _wait_stabilize(self):
@@ -476,6 +593,12 @@ class QualifierMission:
         cur_n = pose["north"]
         cur_e = pose["east"]
 
+        # Update visited grid — trigger SCAN on first cell entry with active streak
+        if self._update_grid(pose):
+            print("[FSM] EXPLORE → SCAN (new cell + active detection streak)")
+            self._state = MissionState.SCAN
+            return
+
         # Emergency boundary recovery
         if self._is_near_wall(cur_n, cur_e, extra=0.5):
             safe_n = self._origin_n + (ZONE1_N[0] + ZONE1_N[1]) / 2.0
@@ -512,6 +635,13 @@ class QualifierMission:
     async def _tick_scan(self):
         print("[FSM] SCAN — stub: running 360° scan then returning to EXPLORE")
         await self._startup_scan()
+        # Mark current cell scan_done so we don't re-trigger on re-entry
+        if self._grid is not None:
+            pose = self._pose()
+            ci, cj = self._ned_to_cell(pose["north"], pose["east"])
+            if self._valid_cell(ci, cj):
+                self._grid[ci][cj].scan_done = True
+                print(f"[GRID] Cell ({ci},{cj}) marked scan_done")
         self._state = MissionState.EXPLORE
 
     # ------------------------------------------------------------------
@@ -597,6 +727,7 @@ class QualifierMission:
         p = self._pose()
         self._origin_n = p["north"]
         self._origin_e = p["east"]
+        self._init_grid()    # build visited grid now that origin is known
         print(f"[INIT] Spawn NED: N={self._origin_n:.2f} E={self._origin_e:.2f}")
         print(f"[INIT] Zone 1 (main floor)    "
               f"N [{self._origin_n+ZONE1_N[0]:.1f} → {self._origin_n+ZONE1_N[1]:.1f}]  "
