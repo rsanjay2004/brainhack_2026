@@ -128,6 +128,7 @@ class QualifierMission:
         self.tracker = DetectionTracker(MERGE_DIST)
         self.state = SharedState()
         self.stop_evt = asyncio.Event()
+        self._last_detection_frame_id = -1
 
         self.planner = AvoidancePlanner(
             K=CAM_K,
@@ -352,29 +353,42 @@ class QualifierMission:
         print(f"[SCAN] Done — {len(pts)} obstacle points in initial map")
 
     # ------------------------------------------------------------------
-    # Detection with consecutive-frame confirmation
+    # Detection with new-frame-only consecutive confirmation
     # ------------------------------------------------------------------
     def _run_detection(self):
-        result = self.detector.detect(phase=self._phase)
-
-        self._yellow_streak = (self._yellow_streak + 1) if result["yellow"] else 0
-        self._red_streak    = (self._red_streak    + 1) if result["red"]    else 0
-
         p = self._pose()
         if p is None:
             return
+
+        result = self.detector.detect(phase=self._phase)
+
+        frame_id = result.get("frame_id", -1)
+        if frame_id == self._last_detection_frame_id:
+            return
+        self._last_detection_frame_id = frame_id
+
+        yellow_seen = bool(result.get("yellow", False))
+        red_seen = bool(result.get("red", False))
+
+        self._yellow_streak = (self._yellow_streak + 1) if yellow_seen else 0
+        self._red_streak = (self._red_streak + 1) if red_seen else 0
+
         n, e = p["north"], p["east"]
 
         if self._yellow_streak >= DETECT_CONFIRM:
             if self.tracker.try_add_yellow(n, e):
-                print(f"[DETECT] YELLOW #{self.tracker.yellow_count}  "
-                      f"N={n:.1f} E={e:.1f}  {self.tracker.summary()}")
+                print(
+                    f"[DETECT] YELLOW #{self.tracker.yellow_count}  "
+                    f"N={n:.1f} E={e:.1f}  {self.tracker.summary()}"
+                )
             self._yellow_streak = 0
 
         if self._red_streak >= DETECT_CONFIRM:
             if self.tracker.try_add_red(n, e):
-                print(f"[DETECT] RED #{self.tracker.red_count}  "
-                      f"N={n:.1f} E={e:.1f}  {self.tracker.summary()}")
+                print(
+                    f"[DETECT] RED #{self.tracker.red_count}  "
+                    f"N={n:.1f} E={e:.1f}  {self.tracker.summary()}"
+                )
             self._red_streak = 0
 
     # ------------------------------------------------------------------
