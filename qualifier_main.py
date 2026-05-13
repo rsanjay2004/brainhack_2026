@@ -13,9 +13,21 @@ from barrel_detector import BarrelDetector, DetectionTracker
 
 DEPTH_TOPIC = "/depth_camera"
 
-# Arena size — adjust if the released map differs
-ARENA_W = 40.0
-ARENA_D = 40.0
+# L-shaped arena zone offsets from spawn NED (m)
+# Map: world origin bottom-left; drone spawns ~N=4 E=12
+# Zone 1 — main floor (bottom section of L)
+ZONE1_N = (-4.0,  16.0)
+ZONE1_E = (-12.0, 16.0)
+# Zone 2 — upper-left arm
+ZONE2_N = (16.0,  32.0)
+ZONE2_E = (-12.0,  0.0)
+# Zone 3 — upper-right arm
+ZONE3_N = (16.0,  32.0)
+ZONE3_E = (12.0,  28.0)
+# Inaccessible cutout between the two upper arms
+FORBIDDEN_N = (16.0, 36.0)
+FORBIDDEN_E = ( 0.0, 12.0)
+
 WALL_MARGIN = 2.5   # stay this far from walls at all times
 
 # Altitudes
@@ -116,49 +128,81 @@ class QualifierMission:
         }
 
     # ------------------------------------------------------------------
-    # Arena boundary helpers
+    # Arena boundary helpers — L-shaped arena aware
     # All setpoints MUST be clamped through here before being sent.
     # Offsets from initial spawn NED so the sweep works regardless of
     # where in the world the drone spawns.
     # ------------------------------------------------------------------
     @property
-    def _n_min(self): return self._origin_n + WALL_MARGIN
+    def _n_min(self): return self._origin_n + ZONE1_N[0] + WALL_MARGIN
     @property
-    def _n_max(self): return self._origin_n + ARENA_D - WALL_MARGIN
+    def _n_max(self): return self._origin_n + ZONE2_N[1] - WALL_MARGIN
     @property
-    def _e_min(self): return self._origin_e + WALL_MARGIN
+    def _e_min(self): return self._origin_e + ZONE1_E[0] + WALL_MARGIN
     @property
-    def _e_max(self): return self._origin_e + ARENA_W - WALL_MARGIN
+    def _e_max(self): return self._origin_e + ZONE3_E[1] - WALL_MARGIN
+
+    def _in_forbidden(self, n, e, margin=0.0):
+        fn0 = self._origin_n + FORBIDDEN_N[0] - margin
+        fn1 = self._origin_n + FORBIDDEN_N[1] + margin
+        fe0 = self._origin_e + FORBIDDEN_E[0] - margin
+        fe1 = self._origin_e + FORBIDDEN_E[1] + margin
+        return fn0 <= n <= fn1 and fe0 <= e <= fe1
 
     def _clamp(self, n, e):
         n = max(self._n_min, min(self._n_max, n))
         e = max(self._e_min, min(self._e_max, e))
+        # If clamped into the forbidden cutout, nudge toward nearest safe arm
+        if self._in_forbidden(n, e):
+            # Push east toward zone 3 or west toward zone 2
+            mid_e = self._origin_e + (FORBIDDEN_E[0] + FORBIDDEN_E[1]) / 2.0
+            if e >= mid_e:
+                e = self._origin_e + ZONE3_E[0] + WALL_MARGIN
+            else:
+                e = self._origin_e + ZONE2_E[1] - WALL_MARGIN
         return n, e
 
     def _is_near_wall(self, n, e, extra=0.0):
         m = WALL_MARGIN + extra
-        return (n < self._origin_n + m or n > self._origin_n + ARENA_D - m or
-                e < self._origin_e + m or e > self._origin_e + ARENA_W - m)
+        out_of_bounds = (n < self._n_min - WALL_MARGIN + m or
+                         n > self._n_max + WALL_MARGIN - m or
+                         e < self._e_min - WALL_MARGIN + m or
+                         e > self._e_max + WALL_MARGIN - m)
+        return out_of_bounds or self._in_forbidden(n, e, margin=m)
 
     # ------------------------------------------------------------------
-    # Sweep waypoint generation — relative to spawn origin
+    # Sweep waypoint generation — covers all three L-shaped zones
     # ------------------------------------------------------------------
-    def _build_sweep(self, altitude, row_spacing):
+    def _build_zone_sweep(self, altitude, row_spacing):
         down  = -altitude
-        east_cols = list(np.arange(self._e_min, self._e_max + 1e-6, row_spacing))
+        zones = [
+            (ZONE1_N, ZONE1_E),
+            (ZONE2_N, ZONE2_E),
+            (ZONE3_N, ZONE3_E),
+        ]
         wps = []
-        for i, east in enumerate(east_cols):
-            if i % 2 == 0:
-                wps += [(self._n_min, east, down), (self._n_max, east, down)]
-            else:
-                wps += [(self._n_max, east, down), (self._n_min, east, down)]
+        for (n_lo, n_hi), (e_lo, e_hi) in zones:
+            n0 = self._origin_n + n_lo + WALL_MARGIN
+            n1 = self._origin_n + n_hi - WALL_MARGIN
+            e0 = self._origin_e + e_lo + WALL_MARGIN
+            e1 = self._origin_e + e_hi - WALL_MARGIN
+            if n1 <= n0 or e1 <= e0:
+                continue
+            east_cols = list(np.arange(e0, e1 + 1e-6, row_spacing))
+            base = len(wps)
+            for i, east in enumerate(east_cols):
+                east = max(e0, min(e1, east))
+                if (i + base) % 2 == 0:
+                    wps += [(n0, east, down), (n1, east, down)]
+                else:
+                    wps += [(n1, east, down), (n0, east, down)]
         return wps
 
     # ------------------------------------------------------------------
     # Detection with consecutive-frame confirmation
     # ------------------------------------------------------------------
     def _run_detection(self):
-        result = self.detector.detect()
+        result = self.detector.detect(phase=self._phase)
 
         self._yellow_streak = (self._yellow_streak + 1) if result["yellow"] else 0
         self._red_streak    = (self._red_streak    + 1) if result["red"]    else 0
@@ -202,11 +246,11 @@ class QualifierMission:
     def _start_phase(self, phase):
         self._phase = phase
         if phase == "YELLOW":
-            self._waypoints = self._build_sweep(ALT_YELLOW, ROW_SPACING_LOW)
+            self._waypoints = self._build_zone_sweep(ALT_YELLOW, ROW_SPACING_LOW)
             print(f"\n[PHASE 1] Yellow sweep  alt={ALT_YELLOW}m  "
                   f"{len(self._waypoints)} waypoints")
         else:
-            self._waypoints = self._build_sweep(ALT_RED, ROW_SPACING_HIGH)
+            self._waypoints = self._build_zone_sweep(ALT_RED, ROW_SPACING_HIGH)
             print(f"\n[PHASE 2] Red sweep  alt={ALT_RED}m  "
                   f"{len(self._waypoints)} waypoints")
         self._wp_idx        = 0
@@ -266,12 +310,12 @@ class QualifierMission:
     def _compute_setpoint(self, pose, target_n, target_e, target_d, depth):
         cur_n, cur_e = pose["north"], pose["east"]
 
-        # Emergency: drone is outside/near wall — push toward arena centre
+        # Emergency: drone is outside/near wall or in forbidden zone — push to zone 1 centre
         if self._is_near_wall(cur_n, cur_e, extra=0.5):
-            safe_n = (self._n_min + self._n_max) / 2
-            safe_e = (self._e_min + self._e_max) / 2
+            safe_n = self._origin_n + (ZONE1_N[0] + ZONE1_N[1]) / 2.0
+            safe_e = self._origin_e + (ZONE1_E[0] + ZONE1_E[1]) / 2.0
             yaw = math.degrees(math.atan2(safe_e - cur_e, safe_n - cur_n))
-            print(f"[BOUNDARY] Near wall at N={cur_n:.1f} E={cur_e:.1f} — returning to centre")
+            print(f"[BOUNDARY] Near wall/forbidden at N={cur_n:.1f} E={cur_e:.1f} — recovering")
             return safe_n, safe_e, target_d, yaw
 
         # Goal vector toward current waypoint
@@ -355,10 +399,10 @@ class QualifierMission:
             cur_n = pose["north"]
             cur_e = pose["east"]
 
-            # Emergency boundary recovery — overrides everything
+            # Emergency boundary recovery — push to centre of zone 1 (always safe)
             if self._is_near_wall(cur_n, cur_e, extra=0.5):
-                safe_n = (self._n_min + self._n_max) / 2
-                safe_e = (self._e_min + self._e_max) / 2
+                safe_n = self._origin_n + (ZONE1_N[0] + ZONE1_N[1]) / 2.0
+                safe_e = self._origin_e + (ZONE1_E[0] + ZONE1_E[1]) / 2.0
                 await self.drone.send_position_setpoint(safe_n, safe_e, wp[2], 0.0)
                 await asyncio.sleep(0.05)
                 continue
@@ -418,8 +462,15 @@ class QualifierMission:
         self._origin_n = p["north"]
         self._origin_e = p["east"]
         print(f"[INIT] Spawn NED: N={self._origin_n:.2f} E={self._origin_e:.2f}")
-        print(f"[INIT] Arena bounds  N [{self._n_min:.1f} → {self._n_max:.1f}]"
-              f"  E [{self._e_min:.1f} → {self._e_max:.1f}]")
+        print(f"[INIT] Zone 1 (main floor)    "
+              f"N [{self._origin_n+ZONE1_N[0]:.1f} → {self._origin_n+ZONE1_N[1]:.1f}]  "
+              f"E [{self._origin_e+ZONE1_E[0]:.1f} → {self._origin_e+ZONE1_E[1]:.1f}]")
+        print(f"[INIT] Zone 2 (upper-left)    "
+              f"N [{self._origin_n+ZONE2_N[0]:.1f} → {self._origin_n+ZONE2_N[1]:.1f}]  "
+              f"E [{self._origin_e+ZONE2_E[0]:.1f} → {self._origin_e+ZONE2_E[1]:.1f}]")
+        print(f"[INIT] Zone 3 (upper-right)   "
+              f"N [{self._origin_n+ZONE3_N[0]:.1f} → {self._origin_n+ZONE3_N[1]:.1f}]  "
+              f"E [{self._origin_e+ZONE3_E[0]:.1f} → {self._origin_e+ZONE3_E[1]:.1f}]")
 
         self._start_time = time.monotonic()
         self._reset_stuck()

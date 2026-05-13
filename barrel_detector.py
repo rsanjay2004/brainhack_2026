@@ -57,21 +57,28 @@ class BarrelDetector:
         with self._lock:
             self._latest_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-    def detect(self):
+    def detect(self, phase="YELLOW"):
         with self._lock:
             frame = self._latest_frame.copy() if self._latest_frame is not None else None
         if frame is None:
             return {"yellow": False, "red": False}
-        return self._detect_yolo(frame) if self._yolo else self._detect_colour(frame)
+        return self._detect_yolo(frame) if self._yolo else self._detect_colour(frame, phase)
 
-    def _detect_colour(self, frame_bgr):
+    def _detect_colour(self, frame_bgr, phase="YELLOW"):
         kernel = np.ones((5, 5), np.uint8)
         h, w   = frame_bgr.shape[:2]
 
-        # Check both the full frame and the bottom half separately.
-        # Yellow barrels are on the ground and appear in the lower portion
-        # of the forward-facing camera; checking both regions reduces misses.
-        regions = [frame_bgr, frame_bgr[h // 2:, :]]
+        # Phase-aware ROI selection:
+        # YELLOW phase — fly at 1.8 m; ground barrels (~0.5 m tall) project
+        #   onto the bottom ~35% of the 480 px frame at 2-5 m range.
+        #   Check bottom 40% first, then full frame as fallback.
+        # RED phase — fly at 4.5 m; elevated barrels (~2-3 m tall) project
+        #   onto the lower-middle portion (rows 150-420).
+        #   Check that band first, then full frame as fallback.
+        if phase == "YELLOW":
+            regions = [frame_bgr[int(h * 0.60):, :], frame_bgr]
+        else:
+            regions = [frame_bgr[int(h * 0.30):int(h * 0.88), :], frame_bgr]
 
         yellow_found = False
         red_found    = False
