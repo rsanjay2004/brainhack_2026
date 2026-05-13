@@ -31,18 +31,25 @@ class Drone:
                 print("Connected")
                 break
 
-    async def _wait_armable(self, timeout=60.0):
+    async def _wait_armable(self, timeout=90.0, stable_samples=15):
         """
-        Stream health() until PX4 reports the system is ready to arm.
-        Checks is_armable (PX4's composite pre-arm flag) first, then
-        falls back to is_local_position_ok for GNSS-denied configs where
-        is_armable may lag behind actual readiness.
-        Returns True when ready, False on timeout.
+        Indoor/GNSS-denied readiness gate.
+        Wait for stable local-position readiness or a true armable state.
         """
+        consecutive = 0
+
         async def _check():
+            nonlocal consecutive
             async for health in self.drone.telemetry.health():
                 if health.is_armable:
                     return
+
+                if health.is_local_position_ok:
+                    consecutive += 1
+                    if consecutive >= stable_samples:
+                        return
+                else:
+                    consecutive = 0
 
         try:
             await asyncio.wait_for(_check(), timeout=timeout)
@@ -76,6 +83,7 @@ class Drone:
                 "Did you run: commander set_ekf_origin 47.397742 8.545594 488.0 ?"
             )
         print("[DRONE] Pre-arm checks passed — arming")
+        await asyncio.sleep(2.0)
 
         # ── Step 3: arm with retry (transient MAVSDK timing can cause one-off denials)
         last_exc = None
