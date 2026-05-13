@@ -50,11 +50,11 @@ class BarrelDetector:
     to have class names containing 'yellow' and 'red' (or class IDs 0 and 1).
     """
 
-    def __init__(self, model_path: str = "barrels.pt"):
+    def __init__(self, model_path: str = ""):
         self._lock = threading.Lock()
         self._latest_frame = None
 
-        # Optional YOLO model
+        # Optional YOLO model (pass path to the qualifier model from Discord)
         self._yolo = None
         if model_path and os.path.exists(model_path):
             try:
