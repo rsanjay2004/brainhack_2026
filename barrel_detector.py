@@ -12,22 +12,26 @@ CAMERA_TOPIC = (
     "/link/camera_link/sensor/IMX214/image"
 )
 
-# HSV ranges for yellow barrels
-YELLOW_LOWER = np.array([18, 100, 100])
-YELLOW_UPPER = np.array([38, 255, 255])
+# Yellow barrel — wider H range and lower S/V thresholds to handle
+# Gazebo's lighting which can desaturate colours compared to real life
+YELLOW_LOWER = np.array([15,  60,  60])
+YELLOW_UPPER = np.array([45, 255, 255])
 
-# HSV ranges for red barrels (red wraps around hue=0, so two ranges needed)
-RED_LOWER1 = np.array([0,  130, 100])
-RED_UPPER1 = np.array([10, 255, 255])
-RED_LOWER2 = np.array([165, 130, 100])
+# Red barrel — hue wraps at 0/180 in OpenCV so two ranges are needed
+RED_LOWER1 = np.array([0,   60,  60])
+RED_UPPER1 = np.array([15, 255, 255])
+RED_LOWER2 = np.array([155,  60,  60])
 RED_UPPER2 = np.array([180, 255, 255])
 
-MIN_BLOB_AREA = 400  # px² — minimum contour size to count as a detection
+# Minimum contour area to count as a detection (px²)
+# Separate thresholds: red barrels are elevated and may appear smaller
+MIN_AREA_YELLOW = 300
+MIN_AREA_RED    = 200
 
 
 class BarrelDetector:
 
-    def __init__(self, model_path: str = ""):
+    def __init__(self, model_path=""):
         self._lock         = threading.Lock()
         self._latest_frame = None
         self._yolo         = None
@@ -36,18 +40,20 @@ class BarrelDetector:
             try:
                 from ultralytics import YOLO
                 self._yolo = YOLO(model_path)
-                print(f"[Detector] YOLO model loaded: {model_path}")
+                print(f"[Detector] YOLO model: {model_path}")
             except Exception as exc:
-                print(f"[Detector] YOLO load failed ({exc}), using colour detection")
+                print(f"[Detector] YOLO failed ({exc}), using colour detection")
 
         self._node = Node()
         if self._node.subscribe(Image, CAMERA_TOPIC, self._on_image):
-            print(f"[Detector] Camera subscribed")
+            print("[Detector] Camera subscribed")
         else:
-            print(f"[Detector] WARNING: camera subscription failed")
+            print("[Detector] WARNING: camera subscription failed — check topic name")
 
     def _on_image(self, msg: Image):
-        frame = np.frombuffer(msg.data, dtype=np.uint8).reshape((msg.height, msg.width, 3))
+        frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+            (msg.height, msg.width, 3)
+        )
         with self._lock:
             self._latest_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
@@ -59,24 +65,44 @@ class BarrelDetector:
         return self._detect_yolo(frame) if self._yolo else self._detect_colour(frame)
 
     def _detect_colour(self, frame_bgr):
-        hsv    = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
         kernel = np.ones((5, 5), np.uint8)
+        h, w   = frame_bgr.shape[:2]
 
-        y_mask = cv2.morphologyEx(cv2.inRange(hsv, YELLOW_LOWER, YELLOW_UPPER), cv2.MORPH_OPEN, kernel)
-        y_cnts, _ = cv2.findContours(y_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        yellow = any(cv2.contourArea(c) >= MIN_BLOB_AREA for c in y_cnts)
+        # Check both the full frame and the bottom half separately.
+        # Yellow barrels are on the ground and appear in the lower portion
+        # of the forward-facing camera; checking both regions reduces misses.
+        regions = [frame_bgr, frame_bgr[h // 2:, :]]
 
-        r_mask = cv2.bitwise_or(cv2.inRange(hsv, RED_LOWER1, RED_UPPER1),
-                                cv2.inRange(hsv, RED_LOWER2, RED_UPPER2))
-        r_mask = cv2.morphologyEx(r_mask, cv2.MORPH_OPEN, kernel)
-        r_cnts, _ = cv2.findContours(r_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        red = any(cv2.contourArea(c) >= MIN_BLOB_AREA for c in r_cnts)
+        yellow_found = False
+        red_found    = False
 
-        return {"yellow": yellow, "red": red}
+        for region in regions:
+            hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+
+            # Yellow
+            y_mask = cv2.morphologyEx(
+                cv2.inRange(hsv, YELLOW_LOWER, YELLOW_UPPER),
+                cv2.MORPH_OPEN, kernel
+            )
+            cnts, _ = cv2.findContours(y_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if any(cv2.contourArea(c) >= MIN_AREA_YELLOW for c in cnts):
+                yellow_found = True
+
+            # Red (two hue ranges merged)
+            r_mask = cv2.bitwise_or(
+                cv2.inRange(hsv, RED_LOWER1, RED_UPPER1),
+                cv2.inRange(hsv, RED_LOWER2, RED_UPPER2),
+            )
+            r_mask = cv2.morphologyEx(r_mask, cv2.MORPH_OPEN, kernel)
+            cnts, _ = cv2.findContours(r_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if any(cv2.contourArea(c) >= MIN_AREA_RED for c in cnts):
+                red_found = True
+
+        return {"yellow": yellow_found, "red": red_found}
 
     def _detect_yolo(self, frame_bgr):
         yellow, red = False, False
-        for result in self._yolo(frame_bgr, verbose=False, conf=0.4):
+        for result in self._yolo(frame_bgr, verbose=False, conf=0.35):
             for box in result.boxes or []:
                 cls_id = int(box.cls[0].cpu().item())
                 name   = self._yolo.names.get(cls_id, "").lower()
@@ -89,7 +115,7 @@ class BarrelDetector:
 
 class DetectionTracker:
 
-    def __init__(self, merge_distance: float = 3.0):
+    def __init__(self, merge_distance=3.0):
         self._merge  = merge_distance
         self._lock   = threading.Lock()
         self._yellow = []
@@ -127,6 +153,6 @@ class DetectionTracker:
         return self.yellow_count * 50 + self.red_count * 100
 
     def summary(self):
-        return (f"Y={self.yellow_count}x50={self.yellow_count*50}  "
-                f"R={self.red_count}x100={self.red_count*100}  "
+        return (f"Y={self.yellow_count}x50={self.yellow_count * 50}  "
+                f"R={self.red_count}x100={self.red_count * 100}  "
                 f"Total={self.score()}")
