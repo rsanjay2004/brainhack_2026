@@ -31,14 +31,40 @@ class Drone:
                 print("Connected")
                 break
 
+    async def _wait_armable(self, timeout=60.0):
+        """
+        Stream health() until local position is valid (EKF ready).
+        Returns True when ready, False on timeout.
+        Uses is_local_position_ok — correct for GNSS-denied indoor flight
+        where EKF origin is set manually via 'commander set_ekf_origin'.
+        """
+        async def _check():
+            async for health in self.drone.telemetry.health():
+                if health.is_local_position_ok:
+                    return
+
+        try:
+            await asyncio.wait_for(_check(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
     async def arm_and_takeoff(self):
+        print("[DRONE] Waiting for EKF / local position to be ready...")
+        ready = await self._wait_armable(timeout=60.0)
+        if not ready:
+            raise RuntimeError(
+                "[DRONE] Timed out waiting for local position. "
+                "Did you run: commander set_ekf_origin 47.397742 8.545594 488.0 ?"
+            )
+        print("[DRONE] Local position OK — arming")
         await self.drone.action.arm()
         await self.drone.action.takeoff()
         await asyncio.sleep(20)
         print("Takeoff")
- # Required before start
+        # Required before offboard start
         await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, 0.0))
-        # start offboard mode
+        # Start offboard mode
         await self.drone.offboard.start()
 
     async def land(self):

@@ -579,7 +579,20 @@ class QualifierMission:
         print(f"[FSM] {self._state.value}")
         await asyncio.sleep(2)
         print("[INIT] Arming and taking off...")
-        await self.drone.arm_and_takeoff()
+        try:
+            await self.drone.arm_and_takeoff()
+        except Exception as e:
+            print(f"[FSM] Takeoff failed: {e}")
+            print("[FSM] TAKEOFF → LAND (aborting safely)")
+            self._state = MissionState.LAND
+            self.stop_evt.set()
+            monitor.cancel()
+            try:
+                await monitor
+            except asyncio.CancelledError:
+                pass
+            await self.drone.land()
+            return
 
         p = self._pose()
         self._origin_n = p["north"]
