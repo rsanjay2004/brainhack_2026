@@ -10,6 +10,7 @@ from depth_receiver import DepthReceiver
 from AvoidancePlanner import AvoidancePlanner
 from get_position_with_task import SharedState, position_monitor_task
 from barrel_detector import BarrelDetector, DetectionTracker
+from GlobalMapper import GlobalMapper
 
 DEPTH_TOPIC = "/depth_camera"
 
@@ -47,12 +48,18 @@ ARRIVAL_ALT    = 0.5   # vertical arrival threshold (m)
 MISSION_LIMIT  = 600.0 # s — 10 min hard cap
 
 # Virtual target blending
-LOOK_AHEAD = 1.5   # m — smaller = tighter path following
-W_AVOID    = 0.5   # avoidance blend weight (0=pure goal, 1=pure avoidance)
+LOOK_AHEAD  = 1.5  # m — smaller = tighter path following
+W_AVOID     = 0.5  # depth-camera avoidance weight
+W_MEM_AVOID = 0.3  # memory map avoidance weight
 
 # Avoidance
 SAFE_DIST = 3.0
 CRIT_DIST = 1.5
+
+# Map memory
+MAP_RETENTION_M  = 15.0  # prune obstacles beyond this radius (m)
+MAP_INFLUENCE_M  = 4.5   # repulsion influence radius (m)
+MAP_Z_MAX        = 10.0  # max depth to trust in mapper (m)
 
 # Stuck detection
 STUCK_TIMEOUT_S = 10.0
@@ -83,6 +90,15 @@ class QualifierMission:
             K=CAM_K, width=640, height=480,
             safe_distance=SAFE_DIST,
             critical_distance=CRIT_DIST,
+        )
+
+        self.mapper = GlobalMapper(
+            K=CAM_K,
+            cam_height=ALT_YELLOW,
+            obs_h_min=0.1, obs_h_max=2.0,
+            z_min=0.3, z_max=MAP_Z_MAX,
+            yaw_in_degrees=True, yaw_clockwise=True,
+            yaw_smoothing=0.8,
         )
 
         self._start_time = None
@@ -197,6 +213,30 @@ class QualifierMission:
                 else:
                     wps += [(n1, east, down), (n0, east, down)]
         return wps
+
+    # ------------------------------------------------------------------
+    # Startup 360° scan — rotate in place (position-locked) and seed map
+    # ------------------------------------------------------------------
+    async def _startup_scan(self):
+        p = self._pose()
+        hold_n, hold_e, hold_d = p["north"], p["east"], p["down"]
+        print("[SCAN] Starting 360° horizon scan — holding position")
+
+        for yaw in [0, 45, 90, 135, 180, 225, 270, 315]:
+            await self.drone.rotate_to_yaw(float(yaw))
+            await asyncio.sleep(1.2)   # let frame settle after rotation stops
+            depth = self.depth_rx.get_frame()
+            pose  = self._pose()
+            if depth is not None:
+                self.mapper.update_frame(depth, pose)
+            # Keep position locked throughout the dwell
+            await self.drone.send_position_setpoint(hold_n, hold_e, hold_d, float(yaw))
+
+        # Return to north-facing heading
+        await self.drone.rotate_to_yaw(0.0)
+        await asyncio.sleep(0.5)
+        pts = self.mapper.get_global_points()
+        print(f"[SCAN] Done — {len(pts)} obstacle points in initial map")
 
     # ------------------------------------------------------------------
     # Detection with consecutive-frame confirmation
@@ -341,12 +381,16 @@ class QualifierMission:
                 print(f"[AVOID] L={cl['left']:.1f} C={cl['center']:.1f} "
                       f"R={cl['right']:.1f}")
 
-        # Blend goal + avoidance
+        # Memory-map repulsion — obstacles remembered from past frames
+        mem_n, mem_e = self.mapper.get_repulsion_vector(cur_n, cur_e, MAP_INFLUENCE_M)
+
+        # Blend goal + depth avoidance + memory avoidance
         if blocked:
-            blend_n, blend_e = avoid_n, avoid_e
+            blend_n = avoid_n + W_MEM_AVOID * mem_n
+            blend_e = avoid_e + W_MEM_AVOID * mem_e
         else:
-            blend_n = goal_n + W_AVOID * avoid_n
-            blend_e = goal_e + W_AVOID * avoid_e
+            blend_n = goal_n + W_AVOID * avoid_n + W_MEM_AVOID * mem_n
+            blend_e = goal_e + W_AVOID * avoid_e + W_MEM_AVOID * mem_e
 
         mag = math.hypot(blend_n, blend_e)
         if mag > 1e-3:
@@ -368,6 +412,7 @@ class QualifierMission:
     # ------------------------------------------------------------------
     async def _control_loop(self):
         dt = 1.0 / CONTROL_HZ
+        await self._startup_scan()
         self._start_phase("YELLOW")
 
         while True:
@@ -420,6 +465,11 @@ class QualifierMission:
 
             target_n, target_e, target_d = wp
             depth = self.depth_rx.get_frame()
+
+            # Feed depth into sliding-window map
+            if depth is not None:
+                self.mapper.update_frame(depth, pose)
+                self.mapper.prune(pose["north"], pose["east"], MAP_RETENTION_M)
 
             send_n, send_e, send_d, yaw_deg = self._compute_setpoint(
                 pose, target_n, target_e, target_d, depth

@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
@@ -87,13 +89,47 @@ class GlobalMapper:
         self.global_points = np.vstack([self.global_points, global_pts])
         return True
     
+    def prune(self, north, east, retention_radius=15.0):
+        """Remove obstacle points further than retention_radius from current drone position."""
+        if self.global_points.shape[0] == 0:
+            return
+        dists = np.hypot(self.global_points[:, 0] - north,
+                         self.global_points[:, 1] - east)
+        self.global_points = self.global_points[dists <= retention_radius]
+
+    def get_repulsion_vector(self, north, east, influence_radius=4.5):
+        """
+        Return a unit repulsion vector (dn, de) pushing the drone away from
+        remembered nearby obstacles. Returns (0.0, 0.0) if no obstacles are
+        within influence_radius. Closer obstacles contribute more weight (1/d²).
+        """
+        if self.global_points.shape[0] == 0:
+            return 0.0, 0.0
+        dists = np.hypot(self.global_points[:, 0] - north,
+                         self.global_points[:, 1] - east)
+        mask = dists < influence_radius
+        if not np.any(mask):
+            return 0.0, 0.0
+        nearby = self.global_points[mask]
+        d = dists[mask]
+        # Vector from each obstacle toward the drone
+        diff_n = north - nearby[:, 0]
+        diff_e = east  - nearby[:, 1]
+        weights = 1.0 / (d ** 2 + 1e-3)
+        rep_n = np.sum(weights * diff_n / (d + 1e-6))
+        rep_e = np.sum(weights * diff_e / (d + 1e-6))
+        mag = math.hypot(rep_n, rep_e)
+        if mag < 1e-6:
+            return 0.0, 0.0
+        return rep_n / mag, rep_e / mag
+
     def get_global_points(self):
-        """Returns copy of accumulated (north, east) points in meters"""
+        """Returns copy of accumulated (north, east) points in meters."""
         return self.global_points.copy()
-    
+
     def save_points(self, filename="global_obstacles.npy"):
         np.save(filename, self.global_points)
-        print(f"✅ Saved {len(self.global_points)} points to {filename}")
+        print(f"Saved {len(self.global_points)} points to {filename}")
 
 
 # ================= Sample usage EXAMPLE =================

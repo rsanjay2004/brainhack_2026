@@ -64,61 +64,23 @@ class Drone:
 
     async def rotate_to_yaw(self, target_yaw_deg, tolerance=2.0):
         """
-        Rotate to a target yaw using PID control
+        Rotate to target yaw while holding current NED position.
+        Uses position setpoints so the position controller fights drift
+        instead of velocity setpoints which allow momentum to carry the drone.
         """
         target_yaw_deg = self._normalize_yaw(target_yaw_deg)
+        lock_n, lock_e, lock_d = await self.get_position()
 
-        # PID gains (tune these!)
-        Kp = 0.8
-        Ki = 0.0
-        Kd = 0.2
-
-        integral = 0.0
-        prev_error = 0.0
-
-        dt = 0.1  # 10 Hz loop
-
-        while True:
-#            yaw_rad = await self.get_yaw()
+        for _ in range(80):  # 8 s max
             current_yaw = await self.get_yaw()
-
-            error = self._yaw_error(target_yaw_deg, current_yaw)
-
-            # Stop condition
-            if abs(error) < tolerance:
+            if abs(self._yaw_error(target_yaw_deg, current_yaw)) < tolerance:
                 break
+            await self.send_position_setpoint(lock_n, lock_e, lock_d, target_yaw_deg)
+            await asyncio.sleep(0.1)
 
-            # PID terms
-            integral += error * dt
-            derivative = (error - prev_error) / dt
-
-            output = Kp * error + Ki * integral + Kd * derivative
-
-            # Clamp yaw rate (deg/s equivalent behavior)
-            max_yaw_rate = 60.0
-            output = max(min(output, max_yaw_rate), -max_yaw_rate)
-
-            # Convert to target yaw step
-            new_yaw = current_yaw + output * dt
-            new_yaw = self._normalize_yaw(new_yaw)
-
-            # Send command
-            await self.drone.offboard.set_velocity_ned(
-                VelocityNedYaw(
-                    north_m_s=0.0,
-                    east_m_s=0.0,
-                    down_m_s=0.0,
-                    yaw_deg=new_yaw
-                )
-            )
-
-            prev_error = error
-            await asyncio.sleep(dt)
-
-        # Final stabilization
-        await self.drone.offboard.set_velocity_ned(
-            VelocityNedYaw(0.0, 0.0, 0.0, target_yaw_deg)
-        )
+        # Final hold — keep sending until caller yields
+        await self.send_position_setpoint(lock_n, lock_e, lock_d, target_yaw_deg)
+        await asyncio.sleep(0.3)
 
     # =========================
     # 🚁 HIGH-LEVEL COMMANDS
