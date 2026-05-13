@@ -347,7 +347,13 @@ class QualifierMission:
 
         self._state = MissionState.CONNECT
         print(f"[FSM] {self._state.value}")
-        await self.drone.connect()
+        try:
+            await self.drone.connect()
+        except Exception as e:
+            print(f"[FSM] Connect failed: {e}")
+            print("[FSM] CONNECT → LAND (abort)")
+            self._state = MissionState.LAND
+            return
         print("[INIT] Connected")
         await asyncio.sleep(3)
 
@@ -357,11 +363,11 @@ class QualifierMission:
         print("[INIT] Arming and taking off...")
         try:
             await self.drone.arm_and_takeoff()
+            self.state.is_armed = True
         except Exception as e:
             print(f"[FSM] Takeoff failed: {e}")
             print("[FSM] TAKEOFF → LAND (aborting safely)")
             self._state = MissionState.LAND
-            self.stop_evt.set()
             await self.drone.land()
             return
 
@@ -371,9 +377,22 @@ class QualifierMission:
 
         # wait briefly for telemetry to populate after starting the monitor
         for _ in range(50):
-            if self.state.latest_position is not None:
+            if self.state.latest_position is not None and self.state.latest_yaw is not None:
                 break
             await asyncio.sleep(0.1)
+
+        if self.state.latest_position is None or self.state.latest_yaw is None:
+            print("[FSM] Telemetry did not populate after takeoff")
+            self._state = MissionState.LAND
+            self.stop_evt.set()
+            if monitor is not None:
+                monitor.cancel()
+                try:
+                    await monitor
+                except asyncio.CancelledError:
+                    pass
+            await self.drone.land()
+            return
 
         p = self._pose()
         self._origin_n = p["north"]
@@ -448,7 +467,10 @@ class QualifierMission:
             self._state = MissionState.LAND
             print(f"[FSM] {self._state.value}")
             print("[LAND] Landing...")
-            await self.drone.land()
+            try:
+                await self.drone.land()
+            finally:
+                self.state.is_armed = False
             print("[DONE]")
 
 

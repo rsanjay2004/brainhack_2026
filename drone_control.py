@@ -41,7 +41,7 @@ class Drone:
         """
         async def _check():
             async for health in self.drone.telemetry.health():
-                if health.is_armable or health.is_local_position_ok:
+                if health.is_armable:
                     return
 
         try:
@@ -69,7 +69,7 @@ class Drone:
 
         # ── Step 2: wait for EKF / pre-arm checks ────────────────────────
         print("[DRONE] Waiting for EKF / pre-arm checks...")
-        ready = await self._wait_armable(timeout=60.0)
+        ready = await self._wait_armable(timeout=90.0)
         if not ready:
             raise RuntimeError(
                 "[DRONE] Timed out waiting for armable state. "
@@ -102,7 +102,10 @@ class Drone:
         await self.drone.offboard.start()
 
     async def land(self):
-        await self.drone.offboard.stop()
+        try:
+            await self.drone.offboard.stop()
+        except Exception:
+            pass
         await self.drone.action.land()
         await asyncio.sleep(10)
         print("land")
