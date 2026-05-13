@@ -327,28 +327,42 @@ class QualifierMission:
         return f"grid={visited}/{navigable}({pct}%)"
 
     # ------------------------------------------------------------------
-    # Startup 360° scan — rotate in place and seed GlobalMapper
+    # Startup 360° scan — rotate relative to current yaw and seed GlobalMapper
     # ------------------------------------------------------------------
     async def _startup_scan(self):
         p = self._pose()
         if p is None:
             return
+
         hold_n, hold_e, hold_d = p["north"], p["east"], p["down"]
+        base_yaw = p["yaw_deg"]
+
         print("[SCAN] Starting 360° horizon scan — holding position")
 
-        for yaw in [0, 45, 90, 135, 180, 225, 270, 315]:
-            await self.drone.rotate_to_yaw(float(yaw))
+        rel_headings = [0, 45, 90, 135, 180, 225, 270, 315]
+
+        for delta_yaw in rel_headings:
+            target_yaw = base_yaw + float(delta_yaw)
+
+            await self.drone.rotate_to_yaw(target_yaw)
             await asyncio.sleep(1.2)
+
             depth = self.depth_rx.get_frame()
-            pose  = self._pose()
-            if p is None:
-                return
+            pose = self._pose()
+            if pose is None:
+                print("[SCAN] Pose lost during startup scan")
+                break
+
             if depth is not None:
                 self.mapper.update_frame(depth, pose)
-            await self.drone.send_position_setpoint(hold_n, hold_e, hold_d, float(yaw))
 
-        await self.drone.rotate_to_yaw(0.0)
+            await self.drone.send_position_setpoint(
+                hold_n, hold_e, hold_d, target_yaw
+            )
+
+        await self.drone.rotate_to_yaw(base_yaw)
         await asyncio.sleep(0.5)
+
         pts = self.mapper.get_global_points()
         print(f"[SCAN] Done — {len(pts)} obstacle points in initial map")
 
@@ -598,7 +612,7 @@ class QualifierMission:
             return
 
         pose  = self._pose()
-        if p is None:
+        if pose is None:
             return
         cur_n = pose["north"]
         cur_e = pose["east"]
@@ -640,20 +654,24 @@ class QualifierMission:
         )
 
     # ------------------------------------------------------------------
-    # State tick: SCAN (stub — Part 2 adds visited-grid trigger)
+    # State tick: SCAN
+    # Runs a 360° local scan, updates the map, marks the current cell as
+    # scanned, then returns to EXPLORE.
     # ------------------------------------------------------------------
     async def _tick_scan(self):
-        print("[FSM] SCAN — stub: running 360° scan then returning to EXPLORE")
+        print("[FSM] SCAN — running 360° scan then returning to EXPLORE")
         await self._startup_scan()
-        # Mark current cell scan_done so we don't re-trigger on re-entry
+
         if self._grid is not None:
             pose = self._pose()
-            if p is None:
+            if pose is None:
                 return
+
             ci, cj = self._ned_to_cell(pose["north"], pose["east"])
             if self._valid_cell(ci, cj):
                 self._grid[ci][cj].scan_done = True
                 print(f"[GRID] Cell ({ci},{cj}) marked scan_done")
+
         self._state = MissionState.EXPLORE
 
     # ------------------------------------------------------------------
@@ -741,7 +759,7 @@ class QualifierMission:
             position_monitor_task(self.drone, self.state, self.stop_evt)
         )
 
-        # wait briefly for telemetry to populate after starting the monitor
+        # wait for first pose+yaw samples before initializing spawn-relative grid
         for _ in range(50):
             if self.state.latest_position is not None and self.state.latest_yaw is not None:
                 break
@@ -766,7 +784,22 @@ class QualifierMission:
 
         p = self._pose()
         if p is None:
+            print("[FSM] Pose unavailable after telemetry wait")
+            self._state = MissionState.LAND
+            self.stop_evt.set()
+            if monitor is not None:
+                monitor.cancel()
+                try:
+                    await monitor
+                except asyncio.CancelledError:
+                    pass
+            if self.state.is_armed:
+                try:
+                    await self.drone.land()
+                finally:
+                    self.state.is_armed = False
             return
+
         self._origin_n = p["north"]
         self._origin_e = p["east"]
         self._init_grid()
@@ -859,8 +892,14 @@ async def main():
         await mission.run()
     except KeyboardInterrupt:
         print("\n[ABORT] Keyboard interrupt")
+        if mission.state.is_armed:
+            try:
+                await mission.drone.land()
+            finally:
+                mission.state.is_armed = False
+    finally:
         try:
-            await mission.drone.land()
+            mission.detector.close()
         except Exception:
             pass
 
