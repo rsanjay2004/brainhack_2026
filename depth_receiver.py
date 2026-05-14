@@ -13,11 +13,13 @@ class DepthReceiver:
         self.node.subscribe(Image, topic, self.callback)
 
     def callback(self, msg: Image):
-        depth = np.frombuffer(msg.data, dtype=np.float32)
-        depth = depth.reshape((msg.height, msg.width))
-
-        with self.lock:
-            self.depth = depth
+        if not self.lock.acquire(blocking=False):
+            return  # drop frame — main thread holds lock, prevents gz queue backup
+        try:
+            depth = np.frombuffer(msg.data, dtype=np.float32)
+            self.depth = depth.reshape((msg.height, msg.width))
+        finally:
+            self.lock.release()
 
     def get_frame(self):
         with self.lock:

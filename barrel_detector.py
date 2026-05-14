@@ -97,10 +97,12 @@ class BarrelDetector:
         self._node.subscribe(Image, topic, self._on_image)
 
     def _on_image(self, msg: Image) -> None:
-        frame = np.frombuffer(msg.data, dtype=np.uint8).reshape((msg.height, msg.width, 3))
-        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-
-        with self._lock:
+        if not self._lock.acquire(blocking=False):
+            return  # drop frame — prevents gz callback queue backup
+        packet = None
+        try:
+            frame = np.frombuffer(msg.data, dtype=np.uint8).reshape((msg.height, msg.width, 3))
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             self._latest_frame = frame_bgr
             self._latest_frame_id += 1
             self._latest_frame_ts = time.time()
@@ -109,6 +111,11 @@ class BarrelDetector:
                 timestamp=self._latest_frame_ts,
                 frame_bgr=frame_bgr.copy(),
             )
+        finally:
+            self._lock.release()
+
+        if packet is None:
+            return
 
         if self._model is not None:
             try:

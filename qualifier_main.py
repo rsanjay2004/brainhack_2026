@@ -182,6 +182,9 @@ class QualifierMission:
         # Time of last escape (for post-escape look-ahead reduction)
         self._last_escape_time = 0.0
 
+        # AVOID log throttle — print at most 1/s (every 20 ticks at 20 Hz)
+        self._avoid_log_tick = 0
+
     # ------------------------------------------------------------------
     # Time
     # ------------------------------------------------------------------
@@ -354,12 +357,28 @@ class QualifierMission:
     # ------------------------------------------------------------------
     # Rotate waypoint list so first WP is nearest current pose
     # ------------------------------------------------------------------
+    def _is_corner_wp(self, wp):
+        """True when waypoint is near two walls simultaneously (corner trap)."""
+        n, e = wp[0], wp[1]
+        near_s = n < self._n_min + WALL_MARGIN
+        near_n = n > self._n_max - WALL_MARGIN
+        near_w = e < self._e_min + WALL_MARGIN
+        near_e = e > self._e_max - WALL_MARGIN
+        return (near_s or near_n) and (near_w or near_e)
+
     def _rotate_waypoints_to_nearest(self, waypoints):
         p = self._pose()
         if p is None or not waypoints:
             return waypoints
         dists = [math.hypot(wp[0] - p["north"], wp[1] - p["east"]) for wp in waypoints]
-        nearest = int(np.argmin(dists))
+        # Sort candidates by distance; skip corners so first WP is open space
+        order = sorted(range(len(waypoints)), key=lambda i: dists[i])
+        for idx in order:
+            if not self._is_corner_wp(waypoints[idx]):
+                nearest = idx
+                break
+        else:
+            nearest = order[0]  # all corner — fall back to closest
         return waypoints[nearest:] + waypoints[:nearest]
 
     # ------------------------------------------------------------------
@@ -375,11 +394,11 @@ class QualifierMission:
 
         print("[SCAN] Starting 360° horizon scan — holding position")
 
-        for delta_yaw in [0, 45, 90, 135, 180, 225, 270, 315]:
+        for delta_yaw in [0, 90, 180, 270]:
             target_yaw = base_yaw + float(delta_yaw)
 
             await self.drone.rotate_to_yaw(target_yaw)
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(0.8)
 
             depth = self.depth_rx.get_frame()
             pose = self._pose()
@@ -611,9 +630,11 @@ class QualifierMission:
                 avoid_e = (av_e - cur_e) / av_dist
             center_clearance = info["clearance"]["center"]
             if blocked:
-                cl = info["clearance"]
-                print(f"[AVOID] L={cl['left']:.1f} C={cl['center']:.1f} "
-                      f"R={cl['right']:.1f}")
+                self._avoid_log_tick += 1
+                if self._avoid_log_tick % 20 == 1:  # ~1 Hz at 20 Hz control loop
+                    cl = info["clearance"]
+                    print(f"[AVOID] L={cl['left']:.1f} C={cl['center']:.1f} "
+                          f"R={cl['right']:.1f}")
 
         # Memory-map repulsion from GlobalMapper
         mem_n, mem_e = self.mapper.get_repulsion_vector(cur_n, cur_e, MAP_INFLUENCE_M)
@@ -785,11 +806,11 @@ class QualifierMission:
         hold_n, hold_e, hold_d = p["north"], p["east"], p["down"]
         base_yaw = p["yaw_deg"]
 
-        for delta_yaw in [0, 45, 90, 135, 180, 225, 270, 315]:
+        for delta_yaw in [0, 90, 180, 270]:
             target_yaw = base_yaw + float(delta_yaw)
 
             await self.drone.rotate_to_yaw(target_yaw)
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(0.8)
 
             pose = self._pose()
             if pose is None:
@@ -824,6 +845,23 @@ class QualifierMission:
     # ------------------------------------------------------------------
     async def _tick_escape(self):
         await self._escape_stuck()
+
+        # Hold position for 2s so depth/IMU settle before resuming navigation
+        p = self._pose()
+        if p is not None:
+            await self.drone.send_position_setpoint(
+                p["north"], p["east"], p["down"], p["yaw_deg"]
+            )
+        await asyncio.sleep(2.0)
+
+        # Skip the waypoint that caused stuck — don't return to the same corner
+        if self._wp_idx < len(self._waypoints) - 1:
+            self._wp_idx += 1
+            wp = self._current_wp()
+            if wp:
+                print(f"[ESCAPE] Skipping stuck WP → WP {self._wp_idx}/{len(self._waypoints)}  "
+                      f"N={wp[0]:.1f} E={wp[1]:.1f}")
+
         print("[FSM] ESCAPE → EXPLORE")
         self._state = MissionState.EXPLORE
 

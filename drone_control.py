@@ -146,7 +146,7 @@ class Drone:
         target_yaw_deg = self._normalize_yaw(target_yaw_deg)
         lock_n, lock_e, lock_d = await self.get_position()
 
-        for _ in range(80):  # 8 s max
+        for _ in range(40):  # 4 s max
             current_yaw = await self.get_yaw()
             if abs(self._yaw_error(target_yaw_deg, current_yaw)) < tolerance:
                 break
