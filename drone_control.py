@@ -172,3 +172,17 @@ class Drone:
     async def turn_cw_180(self):
         current = await self.get_yaw()
         await self.rotate_to_yaw(current + 180)
+
+    async def recovery_hover(self):
+        """Stop offboard briefly so PX4 attitude control can settle, then re-engage."""
+        try:
+            await self.drone.offboard.stop()
+        except Exception:
+            pass
+        await asyncio.sleep(2.0)
+        await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, 0.0))
+        try:
+            await self.drone.offboard.start()
+        except Exception:
+            pass
+        await asyncio.sleep(1.0)

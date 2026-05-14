@@ -619,6 +619,8 @@ class QualifierMission:
         # Avoidance vector from depth camera (depth already sanitized by caller)
         avoid_n, avoid_e, blocked = 0.0, 0.0, False
         center_clearance = SAFE_DIST
+        left_clearance   = SAFE_DIST
+        right_clearance  = SAFE_DIST
         if depth is not None:
             av_n, av_e, _, info = self.planner.compute_position_ned(
                 depth, pose, step_size=1.0
@@ -629,6 +631,8 @@ class QualifierMission:
                 avoid_n = (av_n - cur_n) / av_dist
                 avoid_e = (av_e - cur_e) / av_dist
             center_clearance = info["clearance"]["center"]
+            left_clearance   = info["clearance"]["left"]
+            right_clearance  = info["clearance"]["right"]
             if blocked:
                 self._avoid_log_tick += 1
                 if self._avoid_log_tick % 20 == 1:  # ~1 Hz at 20 Hz control loop
@@ -641,13 +645,28 @@ class QualifierMission:
         if not (math.isfinite(mem_n) and math.isfinite(mem_e)):
             mem_n, mem_e = 0.0, 0.0
 
-        # Blend: goal + avoidance + memory (goal suppressed when fully blocked)
-        if blocked:
+        # All three sectors critical — random histogram direction unreliable;
+        # use memory repulsion to escape known obstacle cluster
+        all_critical = (left_clearance < CRIT_DIST and center_clearance < CRIT_DIST
+                        and right_clearance < CRIT_DIST)
+
+        # In open space, reduce avoidance weight so goal vector dominates
+        w_avoid = 0.1 if center_clearance >= SAFE_DIST else W_AVOID
+
+        # Blend: goal + avoidance + memory
+        if all_critical:
+            if abs(mem_n) > 1e-3 or abs(mem_e) > 1e-3:
+                blend_n = mem_n
+                blend_e = mem_e
+            else:
+                blend_n = avoid_n
+                blend_e = avoid_e
+        elif blocked:
             blend_n = avoid_n + W_MEM_AVOID * mem_n
             blend_e = avoid_e + W_MEM_AVOID * mem_e
         else:
-            blend_n = goal_n + W_AVOID * avoid_n + W_MEM_AVOID * mem_n
-            blend_e = goal_e + W_AVOID * avoid_e + W_MEM_AVOID * mem_e
+            blend_n = goal_n + w_avoid * avoid_n + W_MEM_AVOID * mem_n
+            blend_e = goal_e + w_avoid * avoid_e + W_MEM_AVOID * mem_e
 
         mag = math.hypot(blend_n, blend_e)
         if mag > 1e-3:
@@ -656,8 +675,11 @@ class QualifierMission:
         else:
             blend_n, blend_e = goal_n, goal_e
 
-        # Dynamic look-ahead: shrink near waypoint, low clearance, post-escape
-        look_ahead = LOOK_AHEAD
+        # Dynamic look-ahead: expand in open space, shrink near obstacles/post-escape
+        if center_clearance >= SAFE_DIST:
+            look_ahead = min(4.0, center_clearance * 0.8)  # faster in open space
+        else:
+            look_ahead = LOOK_AHEAD
         if dist < 3.0:
             look_ahead = min(look_ahead, dist * 0.5)
         if center_clearance < SAFE_DIST:
@@ -881,6 +903,15 @@ class QualifierMission:
 
         while self._state not in (MissionState.DONE, MissionState.LAND):
             t0 = time.monotonic()
+
+            # Flip detection: stop offboard and let PX4 attitude control settle
+            if self.state.is_flipped:
+                roll  = getattr(self.state, 'latest_roll',  0.0) or 0.0
+                pitch = getattr(self.state, 'latest_pitch', 0.0) or 0.0
+                print(f"[RECOVERY] Flip detected (roll={roll:.1f}° pitch={pitch:.1f}°) — recovery hover")
+                await self.drone.recovery_hover()
+                self._reset_stuck()
+                continue
 
             handler = _dispatch.get(self._state)
             if handler is not None:

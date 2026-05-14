@@ -12,8 +12,8 @@ class AvoidancePlanner:
                  max_speed=1.0,
                  safe_distance=2.5,
                  critical_distance=0.8,
-                 num_bins=36,
-                 smoothing_alpha=0.6):
+                 num_bins=18,
+                 smoothing_alpha=0.2):
 
         # --- Camera intrinsics ---
         self.fx = K[0, 0]
@@ -214,6 +214,7 @@ class AvoidancePlanner:
 
         # Defensive sanitization — guard against NaN/Inf/negative depth
         depth_map = self._sanitize(depth_map)
+        depth_map = depth_map[::4, :]  # subsample rows: 480→120 rows, ~4× faster histogram
 
         # --- Step 1: Histogram ---
         histogram, angles, distances = self.compute_histogram(depth_map)

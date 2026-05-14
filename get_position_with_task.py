@@ -8,6 +8,9 @@ class SharedState:
     def __init__(self):
         self.latest_position = None  # NED position from telemetry
         self.latest_yaw = None
+        self.latest_roll = None
+        self.latest_pitch = None
+        self.is_flipped = False      # True when abs(roll) or abs(pitch) > 45°
         self.is_armed = False
         self.control_active = False
 
@@ -27,7 +30,10 @@ async def position_monitor_task(drone: Drone, state: SharedState, stop_event: as
         async for att in drone.drone.telemetry.attitude_euler():
             if stop_event.is_set():
                 break
-            state.latest_yaw = att.yaw_deg
+            state.latest_yaw   = att.yaw_deg
+            state.latest_roll  = att.roll_deg
+            state.latest_pitch = att.pitch_deg
+            state.is_flipped   = (abs(att.roll_deg) > 45.0 or abs(att.pitch_deg) > 45.0)
 
     try:
         # Run both streams concurrently
