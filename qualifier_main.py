@@ -371,14 +371,15 @@ class QualifierMission:
         if p is None or not waypoints:
             return waypoints
         dists = [math.hypot(wp[0] - p["north"], wp[1] - p["east"]) for wp in waypoints]
-        # Sort candidates by distance; skip corners so first WP is open space
+        # Skip any WP within extra=0.1m of any single wall, not just corners
         order = sorted(range(len(waypoints)), key=lambda i: dists[i])
         for idx in order:
-            if not self._is_corner_wp(waypoints[idx]):
+            wp = waypoints[idx]
+            if not self._is_near_wall(wp[0], wp[1], extra=0.1):
                 nearest = idx
                 break
         else:
-            nearest = order[0]  # all corner — fall back to closest
+            nearest = order[0]  # all near-wall — fall back to closest
         return waypoints[nearest:] + waypoints[:nearest]
 
     # ------------------------------------------------------------------
@@ -904,12 +905,16 @@ class QualifierMission:
         while self._state not in (MissionState.DONE, MissionState.LAND):
             t0 = time.monotonic()
 
-            # Flip detection: stop offboard and let PX4 attitude control settle
+            # Flip detection: hold position so attitude settles (no offboard stop)
             if self.state.is_flipped:
-                roll  = getattr(self.state, 'latest_roll',  0.0) or 0.0
-                pitch = getattr(self.state, 'latest_pitch', 0.0) or 0.0
-                print(f"[RECOVERY] Flip detected (roll={roll:.1f}° pitch={pitch:.1f}°) — recovery hover")
-                await self.drone.recovery_hover()
+                roll  = self.state.latest_roll  or 0.0
+                pitch = self.state.latest_pitch or 0.0
+                print(f"[RECOVERY] Flip detected (roll={roll:.1f}° pitch={pitch:.1f}°) — holding position")
+                p = self._pose()
+                if p is not None:
+                    await self.drone.recovery_hover(
+                        p["north"], p["east"], p["down"], p["yaw_deg"]
+                    )
                 self._reset_stuck()
                 continue
 

@@ -33,7 +33,7 @@ async def position_monitor_task(drone: Drone, state: SharedState, stop_event: as
             state.latest_yaw   = att.yaw_deg
             state.latest_roll  = att.roll_deg
             state.latest_pitch = att.pitch_deg
-            state.is_flipped   = (abs(att.roll_deg) > 45.0 or abs(att.pitch_deg) > 45.0)
+            state.is_flipped   = (abs(att.roll_deg) > 70.0 or abs(att.pitch_deg) > 70.0)
 
     try:
         # Run both streams concurrently
