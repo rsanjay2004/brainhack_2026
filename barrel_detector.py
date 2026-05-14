@@ -190,13 +190,18 @@ class BarrelDetector:
         else:
             roi = hsv[int(h * 0.10): int(h * 0.80), :]
 
-        yellow_mask = cv2.inRange(roi, YELLOW_LOWER, YELLOW_UPPER)
-        red_mask_1 = cv2.inRange(roi, RED_LOWER1, RED_UPPER1)
-        red_mask_2 = cv2.inRange(roi, RED_LOWER2, RED_UPPER2)
-        red_mask = cv2.bitwise_or(red_mask_1, red_mask_2)
-
-        yellow = self._mask_has_object(yellow_mask, MIN_AREA_YELLOW)
-        red = self._mask_has_object(red_mask, MIN_AREA_RED)
+        # Phase-gate: only check the relevant colour — prevents cross-firing
+        if phase.upper() == "YELLOW":
+            yellow_mask = cv2.inRange(roi, YELLOW_LOWER, YELLOW_UPPER)
+            yellow = self._mask_has_object(yellow_mask, MIN_AREA_YELLOW)
+            red = False
+        else:
+            red_mask = cv2.bitwise_or(
+                cv2.inRange(roi, RED_LOWER1, RED_UPPER1),
+                cv2.inRange(roi, RED_LOWER2, RED_UPPER2),
+            )
+            red = self._mask_has_object(red_mask, MIN_AREA_RED)
+            yellow = False
 
         detections: List[Dict[str, Any]] = []
         if yellow:

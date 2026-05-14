@@ -1,20 +1,19 @@
 import math
-
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap, BoundaryNorm
 from top_down import depth_to_xy_map
-from depth_receiver import DepthReceiver
-import time
-from drone_control import Drone
-import asyncio
-from get_position_with_task import SharedState, position_monitor_task, run
+
+
+# Hard cap on accumulated obstacle points — prevents unbounded memory growth
+MAX_POINTS = 5000
+
+# Spatial deduplication resolution — one point kept per VOXEL_SIZE × VOXEL_SIZE cell
+VOXEL_SIZE = 0.5  # meters
 
 
 class GlobalMapper:
     """
     Incremental top-down occupancy grid mapper using NED (North-East-Down) pose.
-    
+
     Coordinate Conventions:
     - Pose: {'north': float, 'east': float, 'yaw': float}
     - Yaw: radians, clockwise from North (standard NED heading)
@@ -31,64 +30,108 @@ class GlobalMapper:
         self.obs_h_max = obs_h_max
         self.z_min = z_min
         self.z_max = z_max
-        
+
         # Yaw handling
         self.yaw_in_degrees = yaw_in_degrees
         self.yaw_clockwise = yaw_clockwise
         self.yaw_smoothing = yaw_smoothing
         self.last_yaw_rad = 0.0
         self.first_frame = True
-        
+
         # Global point storage: (N, 2) array [north, east] in meters
         self.global_points = np.empty((0, 2), dtype=np.float32)
-        
+
+    # -------------------------------------------------
+    # Internal helpers
+    # -------------------------------------------------
+
+    def _sanitize_depth(self, depth_img):
+        d = np.array(depth_img, dtype=np.float32)
+        bad = ~np.isfinite(d) | (d <= 0)
+        d[bad] = self.z_max
+        return d
+
+    def _voxel_filter(self, points):
+        """Keep one point per VOXEL_SIZE grid cell — reduces dense clusters."""
+        if points.shape[0] == 0:
+            return points
+        keys = np.floor(points / VOXEL_SIZE).astype(np.int32)
+        structured = np.ascontiguousarray(keys).view(
+            np.dtype((np.void, keys.dtype.itemsize * keys.shape[1]))
+        )
+        _, idx = np.unique(structured, return_index=True)
+        return points[idx]
+
     def _local_to_ned_global(self, local_xy, north, east, yaw_rad):
-        """Transform local (X_cam=right, Z_cam=forward) to NED global (north, east)"""
+        """Transform local (X_cam=right, Z_cam=forward) to NED global (north, east)."""
         X_cam = local_xy[:, 0]
         Z_cam = local_xy[:, 1]
         c, s = np.cos(yaw_rad), np.sin(yaw_rad)
-        
         north_global = north + Z_cam * c - X_cam * s
         east_global  = east  + Z_cam * s + X_cam * c
         return np.column_stack([north_global, east_global])
-    
+
+    # -------------------------------------------------
+    # Core API
+    # -------------------------------------------------
+
     def update_frame(self, depth_img, pose):
-        north = pose['north']
-        east = pose['east']
+        north   = pose['north']
+        east    = pose['east']
         raw_yaw = pose['yaw']
-        
+
         # 1. Yaw conversion & smoothing
         if self.yaw_in_degrees:
             raw_yaw = np.deg2rad(raw_yaw)
         if not self.yaw_clockwise:
             raw_yaw = -raw_yaw
-            
+
         if self.first_frame:
             self.last_yaw_rad = raw_yaw
             self.first_frame = False
         else:
-            raw_yaw = self.yaw_smoothing * raw_yaw + (1 - self.yaw_smoothing) * self.last_yaw_rad
+            raw_yaw = (self.yaw_smoothing * raw_yaw
+                       + (1 - self.yaw_smoothing) * self.last_yaw_rad)
         self.last_yaw_rad = raw_yaw
         yaw = raw_yaw
-        
-        # 2. Extract local obstacle coordinates
+
+        # 2. Sanitize depth before projection
+        depth_clean = self._sanitize_depth(depth_img)
+
+        # 3. Extract local obstacle coordinates
         xy_obstacles = depth_to_xy_map(
-            depth_img, self.K,
+            depth_clean, self.K,
             cam_height=self.cam_height,
             obs_h_min=self.obs_h_min,
             obs_h_max=self.obs_h_max,
             z_min=self.z_min,
-            z_max=self.z_max
+            z_max=self.z_max,
         )
-        
+
         if xy_obstacles.shape[0] == 0:
             return False
-            
-        # 3. Transform to global NED frame & accumulate
+
+        # 4. Transform to global NED
         global_pts = self._local_to_ned_global(xy_obstacles, north, east, yaw)
+
+        # 5. Drop any non-finite points produced by bad pose or projection
+        valid = np.isfinite(global_pts).all(axis=1)
+        global_pts = global_pts[valid]
+        if global_pts.shape[0] == 0:
+            return False
+
+        # 6. Accumulate
         self.global_points = np.vstack([self.global_points, global_pts])
+
+        # 7. Spatial deduplication — one point per VOXEL_SIZE cell
+        self.global_points = self._voxel_filter(self.global_points)
+
+        # 8. Hard cap — keep most recent MAX_POINTS if exceeded
+        if self.global_points.shape[0] > MAX_POINTS:
+            self.global_points = self.global_points[-MAX_POINTS:]
+
         return True
-    
+
     def prune(self, north, east, retention_radius=15.0):
         """Remove obstacle points further than retention_radius from current drone position."""
         if self.global_points.shape[0] == 0:
@@ -105,19 +148,29 @@ class GlobalMapper:
         """
         if self.global_points.shape[0] == 0:
             return 0.0, 0.0
-        dists = np.hypot(self.global_points[:, 0] - north,
-                         self.global_points[:, 1] - east)
+
+        # Drop any corrupted points before computing repulsion
+        valid = np.isfinite(self.global_points).all(axis=1)
+        pts = self.global_points[valid]
+        if pts.shape[0] == 0:
+            return 0.0, 0.0
+
+        dists = np.hypot(pts[:, 0] - north, pts[:, 1] - east)
         mask = dists < influence_radius
         if not np.any(mask):
             return 0.0, 0.0
-        nearby = self.global_points[mask]
+
+        nearby = pts[mask]
         d = dists[mask]
-        # Vector from each obstacle toward the drone
         diff_n = north - nearby[:, 0]
         diff_e = east  - nearby[:, 1]
         weights = 1.0 / (d ** 2 + 1e-3)
         rep_n = np.sum(weights * diff_n / (d + 1e-6))
         rep_e = np.sum(weights * diff_e / (d + 1e-6))
+
+        if not (math.isfinite(rep_n) and math.isfinite(rep_e)):
+            return 0.0, 0.0
+
         mag = math.hypot(rep_n, rep_e)
         if mag < 1e-6:
             return 0.0, 0.0
@@ -134,6 +187,14 @@ class GlobalMapper:
 
 # ================= Sample usage EXAMPLE =================
 async def run():
+    import asyncio
+    import time
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from depth_receiver import DepthReceiver
+    from drone_control import Drone
+    from get_position_with_task import SharedState, position_monitor_task
+
     K = np.array([[433.0, 0.0, 320.0],
                   [0.0, 433.0, 240.0],
                   [0.0, 0.0, 1.0]])
@@ -142,84 +203,64 @@ async def run():
 
     mapper = GlobalMapper(
         K, cam_height=1.0, obs_h_min=0.1, obs_h_max=1.5,
-        yaw_in_degrees=True, yaw_smoothing=1.0,z_min=0.3,z_max=5.0
+        yaw_in_degrees=True, yaw_smoothing=1.0, z_min=0.3, z_max=5.0
     )
-        
+
     fig, ax = plt.subplots(figsize=(8, 8))
-    
-    cmap = plt.cm.colors.ListedColormap(['#808080', '#FFFFFF', '#000000'])
-    
+
     stop_event = asyncio.Event()
-    # 1. SETUP THE DRONE 
     drone = Drone()
     await drone.connect()
     await drone.arm_and_takeoff()
 
-    # 2. Setup shared state & cancellation
-    state = SharedState()    
-    # Start background position monitor task
-    monitor_task = asyncio.create_task(position_monitor_task(drone, state, stop_event))
+    state = SharedState()
+    monitor_task = asyncio.create_task(
+        position_monitor_task(drone, state, stop_event)
+    )
     await asyncio.sleep(3)
 
     for i in range(3):
-        pose = {}
-        pose['yaw'] = state.latest_yaw
-        pose['north'] = state.latest_position.north_m
-        pose['east'] = state.latest_position.east_m
-        pose['down'] = state.latest_position.down_m
+        pose = {
+            'yaw':   state.latest_yaw,
+            'north': state.latest_position.north_m,
+            'east':  state.latest_position.east_m,
+            'down':  state.latest_position.down_m,
+        }
         depth_img = receiver.get_frame()
         if depth_img is None:
             print("No depth data received yet.")
             continue
         mapper.update_frame(depth_img, pose)
-        print(F"N: {pose['north']} E:{pose['east']} Yaw:{pose['yaw']}")
-        await drone.send_position_setpoint(north=pose['north']+3, east=pose['east'], down=pose['down'], yaw_deg=0)
+        print(f"N: {pose['north']} E:{pose['east']} Yaw:{pose['yaw']}")
+        await drone.send_position_setpoint(
+            north=pose['north'] + 3, east=pose['east'],
+            down=pose['down'], yaw_deg=0
+        )
         await asyncio.sleep(5)
-
-    await drone.send_position_setpoint(north=pose['north'], east=pose['east'], down=pose['down'], yaw_deg=90)
-    await asyncio.sleep(5)
-    pose = {}
-    pose['yaw'] = state.latest_yaw
-    pose['north'] = state.latest_position.north_m
-    pose['east'] = state.latest_position.east_m
-    pose['down'] = state.latest_position.down_m
-    depth_img = receiver.get_frame()
-    if depth_img is None:
-        print("No depth data received yet.")
-    else:
-        mapper.update_frame(depth_img, pose)
-        print(F"N: {pose['north']} E:{pose['east']} Yaw:{pose['yaw']}")
-
-    await drone.send_position_setpoint(north=pose['north'], east=pose['east']+3, down=pose['down'], yaw_deg=90)
-    await asyncio.sleep(5)
-    pose = {}
-    pose['yaw'] = state.latest_yaw
-    pose['north'] = state.latest_position.north_m
-    pose['east'] = state.latest_position.east_m
-    pose['down'] = state.latest_position.down_m
-    depth_img = receiver.get_frame()
-    if depth_img is None:
-        print("No depth data received yet.")
-    else:
-        mapper.update_frame(depth_img, pose)
-        print(F"N: {pose['north']} E:{pose['east']} Yaw:{pose['yaw']}")
-
 
     pts = mapper.get_global_points()
     ax.clear()
     if len(pts) > 0:
-        # Color by distance from origin for depth perception
         dists = np.linalg.norm(pts, axis=1)
         ax.scatter(pts[:, 1], pts[:, 0], c=dists, s=4, cmap='viridis', edgecolors='none')
-    
+
+    pose = {
+        'yaw':   state.latest_yaw,
+        'north': state.latest_position.north_m,
+        'east':  state.latest_position.east_m,
+        'down':  state.latest_position.down_m,
+    }
     ax.plot(pose['east'], pose['north'], 'r*', markersize=12, label='Drone')
-    ax.set_xlabel("East [m]"); ax.set_ylabel("North [m]")
-    ax.set_aspect('equal'); ax.grid(alpha=0.3); ax.legend()
-    plt.pause(0.05)
-    
+    ax.set_xlabel("East [m]")
+    ax.set_ylabel("North [m]")
+    ax.set_aspect('equal')
+    ax.grid(alpha=0.3)
+    ax.legend()
     plt.show()
 
     await drone.land()
 
+
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(run())

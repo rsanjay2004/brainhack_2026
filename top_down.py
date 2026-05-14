@@ -1,8 +1,4 @@
 import numpy as np
-import matplotlib.pyplot as plt
-from depth_receiver import DepthReceiver
-import time
-from matplotlib.patches import Circle
 
 def depth_to_xy_map(
     depth_img, K,
@@ -50,6 +46,11 @@ def depth_to_xy_map(
 
 # ================= EXAMPLE USAGE =================
 if __name__ == "__main__":
+    import time
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+    from depth_receiver import DepthReceiver
+
     # Your exact intrinsic matrix
     K = np.array([[433.0, 0.0, 320.0],
                   [0.0, 433.0, 240.0],

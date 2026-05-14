@@ -37,6 +37,16 @@ class AvoidancePlanner:
         self.prev_down = None
 
     # -------------------------------------------------
+    # Internal depth sanitization
+    # -------------------------------------------------
+    def _sanitize(self, depth_map):
+        fill = self.safe_distance * 4.0
+        d = np.array(depth_map, dtype=float)
+        bad = ~np.isfinite(d) | (d <= 0)
+        d[bad] = fill
+        return d
+
+    # -------------------------------------------------
     # Pixel → angle (intrinsics-based)
     # -------------------------------------------------
     def pixel_to_angle(self, u):
@@ -47,6 +57,7 @@ class AvoidancePlanner:
     # -------------------------------------------------
     def compute_histogram(self, depth_map):
         h, w = depth_map.shape
+        fill = self.safe_distance * 4.0
 
         histogram = np.zeros(self.num_bins)
         angles = np.zeros(self.num_bins)
@@ -60,6 +71,8 @@ class AvoidancePlanner:
 
             # Robust distance (closest obstacles dominate)
             d = np.nanpercentile(region, 20)
+            if not math.isfinite(d) or d <= 0:
+                d = fill
             distances[i] = d
 
             # Cost function
@@ -80,11 +93,17 @@ class AvoidancePlanner:
     # Compute clearance metrics
     # -------------------------------------------------
     def compute_clearance(self, depth_map):
+        fill = self.safe_distance * 4.0
         w = depth_map.shape[1]
 
-        left = np.nanpercentile(depth_map[:, :w//3], 20)
+        left   = np.nanpercentile(depth_map[:, :w//3],       20)
         center = np.nanpercentile(depth_map[:, w//3:2*w//3], 20)
-        right = np.nanpercentile(depth_map[:, 2*w//3:], 20)
+        right  = np.nanpercentile(depth_map[:, 2*w//3:],     20)
+
+        # Guard against NaN/Inf from empty regions
+        if not math.isfinite(left):   left   = fill
+        if not math.isfinite(center): center = fill
+        if not math.isfinite(right):  right  = fill
 
         return left, center, right
 
@@ -164,8 +183,10 @@ class AvoidancePlanner:
     # Position smoothing
     # -------------------------------------------------
     def smooth_position(self, north, east, down):
-        if self.prev_north is None:
-            # First call → no smoothing
+        # Reset smoother if prev state is invalid
+        if (self.prev_north is None
+                or not math.isfinite(self.prev_north)
+                or not math.isfinite(self.prev_east)):
             self.prev_north = north
             self.prev_east = east
             self.prev_down = down
@@ -186,9 +207,13 @@ class AvoidancePlanner:
     # -------------------------------------------------
     def compute_position_ned(self, depth_map, pose, step_size=1.5):
         """
-        Convert avoidance result into NED position setpoint
-        step_size = how far to move per decision (meters)
+        Convert avoidance result into NED position setpoint.
+        step_size = maximum distance to move per decision (meters).
+        Actual step is scaled down by center clearance when near obstacles.
         """
+
+        # Defensive sanitization — guard against NaN/Inf/negative depth
+        depth_map = self._sanitize(depth_map)
 
         # --- Step 1: Histogram ---
         histogram, angles, distances = self.compute_histogram(depth_map)
@@ -215,27 +240,51 @@ class AvoidancePlanner:
             vy_body = math.sin(angle)
 
         # -------------------------------------------------
-        # 🔁 BODY → NED TRANSFORM
+        # BODY → NED TRANSFORM
         # -------------------------------------------------
         yaw = pose["yaw"]
 
-        # Rotation: body → NED
         north_dir = vx_body * math.cos(yaw) - vy_body * math.sin(yaw)
         east_dir  = vx_body * math.sin(yaw) + vy_body * math.cos(yaw)
 
-        # Normalize direction
         norm = math.sqrt(north_dir**2 + east_dir**2) + 1e-6
         north_dir /= norm
         east_dir  /= norm
 
         # -------------------------------------------------
-        # 📍 GENERATE POSITION SETPOINT
+        # CLEARANCE-SCALED STEP SIZE
+        # Reduce step when center is obstructed — less aggressive forward push
         # -------------------------------------------------
-        north = pose["north"] + step_size * north_dir
-        east  = pose["east"]  + step_size * east_dir
+        if center >= self.safe_distance:
+            effective_step = step_size
+        elif center > self.critical_distance:
+            scale = (center - self.critical_distance) / (
+                self.safe_distance - self.critical_distance + 1e-6
+            )
+            effective_step = step_size * max(0.1, scale)
+        else:
+            effective_step = step_size * 0.1  # nearly stopped, just nudge away
+
+        # -------------------------------------------------
+        # GENERATE POSITION SETPOINT
+        # -------------------------------------------------
+        north = pose["north"] + effective_step * north_dir
+        east  = pose["east"]  + effective_step * east_dir
         down  = pose["down"]  # keep altitude constant
 
+        # Guard before smoothing — don't let bad values poison the smoother
+        if not (math.isfinite(north) and math.isfinite(east)):
+            north, east = pose["north"], pose["east"]
+            self.prev_north = None  # reset smoother
+
         north, east, down = self.smooth_position(north, east, down)
+
+        # Final finite guard after smoothing
+        if not (math.isfinite(north) and math.isfinite(east) and math.isfinite(down)):
+            north = pose["north"]
+            east  = pose["east"]
+            down  = pose["down"]
+            self.prev_north = None  # reset smoother
 
         # -------------------------------------------------
         # OUTPUT INFO
