@@ -37,24 +37,24 @@ class Drone:
         """
         Wait for PX4's composite armable flag to be stably true.
         Do not use is_local_position_ok as an arm gate.
+        Polls at 2 Hz to avoid flooding the MAVLink channel with ACK losses.
         """
+        deadline = asyncio.get_event_loop().time() + timeout
         consecutive = 0
-
-        async def _check():
-            nonlocal consecutive
-            async for health in self.drone.telemetry.health():
-                if health.is_armable:
-                    consecutive += 1
-                    if consecutive >= stable_samples:
-                        return
-                else:
-                    consecutive = 0
-
-        try:
-            await asyncio.wait_for(_check(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
-            return False
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                async for health in self.drone.telemetry.health():
+                    if health.is_armable:
+                        consecutive += 1
+                    else:
+                        consecutive = 0
+                    break  # one sample per iteration
+            except Exception:
+                consecutive = 0
+            if consecutive >= stable_samples:
+                return True
+            await asyncio.sleep(0.5)   # 2 Hz — prevents MAVLink ACK flooding
+        return False
 
     async def _is_armed_once(self):
         async for is_armed in self.drone.telemetry.armed():
@@ -74,7 +74,7 @@ class Drone:
         print("[DRONE] Pre-arm checks passed — arming")
         await asyncio.sleep(2.0)
 
-        # Step 2: arm with retry
+        # Step 2: arm with retry — reconnect on gRPC UNAVAILABLE
         last_exc = None
         for attempt in range(3):
             try:
@@ -84,9 +84,16 @@ class Drone:
                 break
             except Exception as e:
                 last_exc = e
+                err_str = str(e)
                 if attempt < 2:
-                    print(f"[DRONE] Arm attempt {attempt + 1}/3 failed: {e} — retrying in 3s")
-                    await asyncio.sleep(3.0)
+                    if "UNAVAILABLE" in err_str or "Connection reset" in err_str:
+                        print(f"[DRONE] Arm attempt {attempt + 1}/3 — gRPC lost, reconnecting...")
+                        await asyncio.sleep(2.0)
+                        await self.connect()
+                        await asyncio.sleep(2.0)
+                    else:
+                        print(f"[DRONE] Arm attempt {attempt + 1}/3 failed: {e} — retrying in 3s")
+                        await asyncio.sleep(3.0)
 
         # Step 3: lost-ACK check
         if last_exc:
