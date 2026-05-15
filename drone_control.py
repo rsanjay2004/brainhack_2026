@@ -52,7 +52,7 @@ class Drone:
     # Pre-arm & arm helpers
     # ------------------------------------------------------------------
 
-    async def _wait_armable(self, timeout=90.0, stable_samples=8):
+    async def _wait_armable(self, timeout=90.0, stable_samples=4):
         """
         Wait for PX4's composite armable flag to be stably true.
         Polls at 2 Hz to avoid flooding the MAVLink channel with ACK losses.
@@ -238,7 +238,7 @@ class Drone:
     # streams setpoints continuously from arm onward — no idle gap.
     # ------------------------------------------------------------------
 
-    async def arm_and_takeoff(self, target_alt=1.8, ascent_timeout=30.0):
+    async def arm_and_takeoff(self, target_alt=1.8, ascent_timeout=60.0):
         # Step 1: pre-arm
         print("[DRONE] Waiting for EKF / pre-arm checks...")
         ready = await self._wait_armable(timeout=90.0, stable_samples=8)
@@ -400,7 +400,7 @@ class Drone:
         lock_e = float(self.state.latest_position.east_m)  if (self.state and self.state.latest_position) else 0.0
         lock_yaw = float(self.state.latest_yaw) if (self.state and self.state.latest_yaw) else 0.0
 
-        deadline = asyncio.get_event_loop().time() + 30.0
+        deadline = asyncio.get_event_loop().time() + 60.0
         last_logged_alt = -999.0
         while asyncio.get_event_loop().time() < deadline:
             alt = await self._read_alt()
