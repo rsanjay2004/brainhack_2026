@@ -320,14 +320,12 @@ class QualifierMission:
         return n, e
 
     def _wp_crosses_forbidden(self, cur_n, cur_e, wp_n, wp_e, samples=10) -> bool:
-        """Return True if line from current pos to WP passes through forbidden zone."""
-        for i in range(samples + 1):
-            t = i / samples
-            sn = cur_n + t * (wp_n - cur_n)
-            se = cur_e + t * (wp_e - cur_e)
-            if self._in_forbidden(sn, se, margin=WALL_MARGIN):
-                return True
-        return False
+        """Return True if WP destination is inside the forbidden zone (no margin).
+        Does NOT check the path — avoidance + wall repulsion handle routing.
+        Checking the path was too aggressive: Zone 1 north-edge WPs at N=13.5
+        sit inside the WALL_MARGIN-expanded forbidden zone even though they are
+        valid Zone 1 navigation targets."""
+        return self._in_forbidden(wp_n, wp_e, margin=0.0)
 
     def _is_near_wall(self, n, e, extra=0.0):
         m = WALL_MARGIN + extra
@@ -994,9 +992,9 @@ class QualifierMission:
                     print(f"[AVOID] L={cl['left']:.1f} C={cl['center']:.1f} "
                           f"R={cl['right']:.1f}")
 
-        # Emergency stop: obstacle < 0.6 m ahead — halt horizontal motion.
-        # VEL_MIN (0.3 m/s) would otherwise keep driving the drone into the object.
-        if center_clearance < 0.6:
+        # Emergency stop: obstacle < 0.6 m ahead OR < 0.5 m to either side.
+        # Side threshold catches corner clips where center clearance looks fine.
+        if center_clearance < 0.6 or min(left_clearance, right_clearance) < 0.5:
             vd = max(-ALT_VEL_MAX, min(ALT_VEL_MAX, ALT_KP * (target_d - pose["down"])))
             return 0.0, 0.0, vd, cur_yaw
 
@@ -1215,11 +1213,13 @@ class QualifierMission:
 
         target_n, target_e, target_d = wp
 
-        # Skip WP immediately if direct path crosses forbidden zone — no timer needed.
+        # Skip WP whose destination is inside the forbidden zone.
         if self._wp_crosses_forbidden(cur_n, cur_e, target_n, target_e):
-            print(f"[BOUNDARY] WP {self._wp_idx} path crosses forbidden zone — skipping")
-            if self._wp_idx < len(self._waypoints) - 1:
-                self._advance_wp()
+            _now = time.monotonic()
+            if _now - self._boundary_log_time >= 5.0:
+                print(f"[BOUNDARY] WP {self._wp_idx} destination in forbidden zone — skipping")
+                self._boundary_log_time = _now
+            self._advance_wp()   # natural phase-done when idx >= len
             return
 
         # Sanitize depth before any planner/map use
