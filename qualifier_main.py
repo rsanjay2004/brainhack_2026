@@ -1676,6 +1676,10 @@ async def main():
             mission.detector.close()
         except Exception:
             pass
+        try:
+            mission.depth_rx.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

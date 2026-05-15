@@ -24,3 +24,9 @@ class DepthReceiver:
     def get_frame(self):
         with self.lock:
             return None if self.depth is None else self.depth.copy()
+
+    def close(self):
+        try:
+            self.node = None  # allow gz Node C++ destructor to run while Python is still alive
+        except Exception:
+            pass
