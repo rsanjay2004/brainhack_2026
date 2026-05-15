@@ -159,12 +159,13 @@ class GridCell:
 # ---------------------------------------------------------------------------
 class QualifierMission:
     def __init__(self, model_path=""):
-        self.drone = Drone()
+        # SharedState first — Drone reads live altitude/mode from it
+        self.state = SharedState()
+        self.stop_evt = asyncio.Event()
+        self.drone = Drone(state=self.state)
         self.depth_rx = DepthReceiver(DEPTH_TOPIC)
         self.detector = BarrelDetector(model_path)
         self.tracker = DetectionTracker(MERGE_DIST)
-        self.state = SharedState()
-        self.stop_evt = asyncio.Event()
 
         self.planner = AvoidancePlanner(
             K=CAM_K,
@@ -1229,6 +1230,19 @@ class QualifierMission:
         print(f"[FSM] Control loop exited — final state: {self._state.value}")
 
     # ------------------------------------------------------------------
+    # Helpers — monitor task teardown
+    # ------------------------------------------------------------------
+    async def _teardown_monitor(self, monitor):
+        if monitor is None:
+            return
+        self.stop_evt.set()
+        monitor.cancel()
+        try:
+            await monitor
+        except asyncio.CancelledError:
+            pass
+
+    # ------------------------------------------------------------------
     # Entry point
     # ------------------------------------------------------------------
     async def run(self):
@@ -1252,46 +1266,52 @@ class QualifierMission:
             self._state = MissionState.LAND
             return
         print("[INIT] Connected")
-        await asyncio.sleep(5)
-
-        self._state = MissionState.TAKEOFF
-        print(f"[FSM] {self._state.value}")
         await asyncio.sleep(2)
-        print("[INIT] Arming and taking off...")
-        try:
-            await self.drone.arm_and_takeoff()
-            self.state.is_armed = True
-        except Exception as e:
-            print(f"[FSM] Takeoff failed: {e}")
-            print("[FSM] TAKEOFF → LAND (aborting safely)")
-            self._state = MissionState.LAND
-            if self.state.is_armed:
-                try:
-                    await self.drone.land()
-                finally:
-                    self.state.is_armed = False
-            return
 
+        # NEW: Start position monitor BEFORE arm/takeoff so Drone has live
+        # altitude/mode access during ascent. Avoids blind sleep(20) trap.
         monitor = asyncio.create_task(
             position_monitor_task(self.drone, self.state, self.stop_evt)
         )
 
-        # wait for first pose+yaw samples before initializing spawn-relative grid
-        for _ in range(50):
+        print("[INIT] Waiting for initial telemetry...")
+        for _ in range(50):  # 5 s timeout
             if self.state.latest_position is not None and self.state.latest_yaw is not None:
                 break
             await asyncio.sleep(0.1)
 
         if self.state.latest_position is None or self.state.latest_yaw is None:
-            print("[FSM] Telemetry did not populate after takeoff")
+            print("[FSM] Initial telemetry did not populate — aborting")
             self._state = MissionState.LAND
-            self.stop_evt.set()
-            if monitor is not None:
-                monitor.cancel()
-                try:
-                    await monitor
-                except asyncio.CancelledError:
-                    pass
+            await self._teardown_monitor(monitor)
+            return
+        print(
+            f"[INIT] Initial telemetry OK — pos N={self.state.latest_position.north_m:.2f} "
+            f"E={self.state.latest_position.east_m:.2f} D={self.state.latest_position.down_m:.2f}"
+        )
+
+        self._state = MissionState.TAKEOFF
+        print(f"[FSM] {self._state.value}")
+        print("[INIT] Arming and taking off (pure OFFBOARD)...")
+        try:
+            await self.drone.arm_and_takeoff(target_alt=ALT_YELLOW)
+            self.state.is_armed = True
+        except Exception as e:
+            print(f"[FSM] Takeoff failed: {e}")
+            print("[FSM] TAKEOFF → LAND (aborting safely)")
+            self._state = MissionState.LAND
+            await self._teardown_monitor(monitor)
+            try:
+                await self.drone.land()
+            except Exception:
+                pass
+            return
+
+        # Telemetry is already populated from monitor — no second wait needed.
+        if self.state.latest_position is None or self.state.latest_yaw is None:
+            print("[FSM] Telemetry lost after takeoff")
+            self._state = MissionState.LAND
+            await self._teardown_monitor(monitor)
             if self.state.is_armed:
                 try:
                     await self.drone.land()
@@ -1301,15 +1321,9 @@ class QualifierMission:
 
         p = self._pose()
         if p is None:
-            print("[FSM] Pose unavailable after telemetry wait")
+            print("[FSM] Pose unavailable after takeoff")
             self._state = MissionState.LAND
-            self.stop_evt.set()
-            if monitor is not None:
-                monitor.cancel()
-                try:
-                    await monitor
-                except asyncio.CancelledError:
-                    pass
+            await self._teardown_monitor(monitor)
             if self.state.is_armed:
                 try:
                     await self.drone.land()
@@ -1344,13 +1358,7 @@ class QualifierMission:
         if not sensors_ok:
             print("[FSM] Sensor gate failed — aborting mission safely.")
             self._state = MissionState.LAND
-            self.stop_evt.set()
-            if monitor is not None:
-                monitor.cancel()
-                try:
-                    await monitor
-                except asyncio.CancelledError:
-                    pass
+            await self._teardown_monitor(monitor)
             await self.drone.land()
             return
 
@@ -1369,13 +1377,7 @@ class QualifierMission:
         except asyncio.CancelledError:
             print("\n[ABORT] Cancelled")
         finally:
-            self.stop_evt.set()
-            if monitor is not None:
-                monitor.cancel()
-                try:
-                    await monitor
-                except asyncio.CancelledError:
-                    pass
+            await self._teardown_monitor(monitor)
 
             elapsed = self._elapsed()
             print("\n" + "=" * 50)

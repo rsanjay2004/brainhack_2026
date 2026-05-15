@@ -1,14 +1,29 @@
 # drone_control.py
 
 from mavsdk import System
-# from mavsdk.offboard import Offboard
 from mavsdk.offboard import VelocityNedYaw, PositionNedYaw
 import asyncio
 import math
 
+
+# Errors that indicate gRPC channel loss — recoverable via reconnect
+_GRPC_LOST_TOKENS = ("UNAVAILABLE", "Socket closed", "Connection reset")
+
+
+def _is_grpc_lost(exc):
+    s = str(exc)
+    return any(tok in s for tok in _GRPC_LOST_TOKENS)
+
+
 class Drone:
-    def __init__(self):
+    def __init__(self, state=None):
+        """
+        state: optional SharedState — when provided, takeoff/ascent reads
+        live altitude/mode from it instead of one-shot polls. Caller must
+        start position_monitor_task BEFORE calling arm_and_takeoff().
+        """
         self.drone = System()
+        self.state = state
 
     def _normalize_yaw(self, yaw_deg):
         while yaw_deg > 180:
@@ -33,16 +48,19 @@ class Drone:
                 print("Connected")
                 break
 
+    # ------------------------------------------------------------------
+    # Pre-arm & arm helpers
+    # ------------------------------------------------------------------
+
     async def _wait_armable(self, timeout=90.0, stable_samples=8):
         """
         Wait for PX4's composite armable flag to be stably true.
-        Do not use is_local_position_ok as an arm gate.
         Polls at 2 Hz to avoid flooding the MAVLink channel with ACK losses.
         """
         deadline = asyncio.get_event_loop().time() + timeout
         start_t = asyncio.get_event_loop().time()
         consecutive = 0
-        last_print = start_t - 4.0  # force immediate first print
+        last_print = start_t - 4.0
         while asyncio.get_event_loop().time() < deadline:
             now = asyncio.get_event_loop().time()
             elapsed = now - start_t
@@ -53,7 +71,7 @@ class Drone:
                         consecutive += 1
                     else:
                         consecutive = 0
-                    break  # one sample per iteration
+                    break
             except Exception:
                 consecutive = 0
             if consecutive >= stable_samples:
@@ -65,8 +83,8 @@ class Drone:
                 bar = "#" * filled + "-" * (bar_len - filled)
                 print(f"\r\033[2K[EKF] Waiting [{bar}] {consecutive}/{stable_samples} | {elapsed:.0f}s elapsed | {remaining:.0f}s left", end="", flush=True)
                 last_print = now
-            await asyncio.sleep(0.5)   # 2 Hz — prevents MAVLink ACK flooding
-        print()  # newline after progress bar
+            await asyncio.sleep(0.5)
+        print()
         return False
 
     async def _is_armed_once(self):
@@ -74,43 +92,116 @@ class Drone:
             return bool(is_armed)
         return False
 
-    async def _enter_offboard(self):
+    async def _arm_with_retry(self, max_attempts=3):
+        """Arm with reconnect-on-UNAVAILABLE retry. Survives lost ACK by polling armed state."""
+        last_exc = None
+        for attempt in range(max_attempts):
+            try:
+                await self.drone.action.arm()
+                print(f"[DRONE] Arm attempt {attempt + 1}/{max_attempts} succeeded")
+                return
+            except Exception as e:
+                last_exc = e
+                if attempt < max_attempts - 1:
+                    if _is_grpc_lost(e):
+                        print(f"[DRONE] Arm attempt {attempt + 1}/{max_attempts} — gRPC lost, reconnecting...")
+                        await asyncio.sleep(2.0)
+                        await self.connect()
+                        await asyncio.sleep(2.0)
+                    else:
+                        print(f"[DRONE] Arm attempt {attempt + 1}/{max_attempts} failed: {e} — retrying in 3s")
+                        await asyncio.sleep(3.0)
+        # Lost-ACK check
+        if await self._is_armed_once():
+            print("[DRONE] Arm ACK was lost but drone is armed — proceeding")
+            return
+        raise last_exc
+
+    # ------------------------------------------------------------------
+    # OFFBOARD lifecycle
+    # ------------------------------------------------------------------
+
+    async def _stream_zero_setpoints(self, count=15, interval=0.1):
+        """Stream VelocityNedYaw(0,0,0,0) setpoints. Required before offboard.start()."""
+        for _ in range(count):
+            try:
+                await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, 0.0))
+            except Exception as e:
+                if _is_grpc_lost(e):
+                    print(f"[DRONE] Setpoint stream — gRPC lost, reconnecting...")
+                    await asyncio.sleep(1.0)
+                    await self.connect()
+                    await asyncio.sleep(1.0)
+                else:
+                    raise
+            await asyncio.sleep(interval)
+
+    async def _in_offboard_now(self):
+        """One-shot OFFBOARD check via flight_mode telemetry (uses SharedState if available)."""
+        if self.state is not None:
+            return bool(self.state.is_in_offboard)
+        async for mode in self.drone.telemetry.flight_mode():
+            return "OFFBOARD" in str(mode).upper()
+        return False
+
+    async def _start_offboard_with_confirm(self, confirm_timeout=5.0):
         """
-        Pre-stream velocity setpoints at 5 Hz for 2 s, then call offboard.start().
-        PX4 requires a continuous setpoint stream before accepting the mode switch —
-        sending just one setpoint then immediately calling start() causes command-176 rejection.
-        Polls flight_mode() for up to 5 s to confirm OFFBOARD actually engaged.
-        Raises RuntimeError if mode is not confirmed.
+        Call offboard.start() and confirm OFFBOARD mode via telemetry.
+        Retries on gRPC loss. Raises RuntimeError if mode not confirmed.
         """
-        print("[DRONE] Entering OFFBOARD mode — pre-streaming setpoints for 2 s...")
-        for _ in range(10):
-            await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, 0.0))
+        last_exc = None
+        for attempt in range(3):
+            try:
+                await self.drone.offboard.start()
+                last_exc = None
+                break
+            except Exception as e:
+                last_exc = e
+                if _is_grpc_lost(e) and attempt < 2:
+                    print(f"[DRONE] offboard.start() {attempt+1}/3 — gRPC lost, reconnecting & re-streaming")
+                    await asyncio.sleep(1.0)
+                    await self.connect()
+                    await asyncio.sleep(1.0)
+                    await self._stream_zero_setpoints(count=10)
+                else:
+                    raise
+        if last_exc:
+            raise last_exc
+
+        # Confirm OFFBOARD via SharedState (fast) or telemetry poll
+        deadline = asyncio.get_event_loop().time() + confirm_timeout
+        while asyncio.get_event_loop().time() < deadline:
+            if await self._in_offboard_now():
+                print("[DRONE] OFFBOARD mode confirmed ✓")
+                return
             await asyncio.sleep(0.2)
 
-        await self.drone.offboard.start()
+        raise RuntimeError(
+            "[DRONE] OFFBOARD mode not confirmed after offboard.start() — "
+            "PX4 rejected mode switch. Check armed state and EKF origin."
+        )
 
-        # Poll telemetry to confirm mode switch (up to 5 s)
-        confirmed = False
-        for _ in range(10):
-            await asyncio.sleep(0.5)
-            async for mode in self.drone.telemetry.flight_mode():
-                if "OFFBOARD" in str(mode).upper():
-                    confirmed = True
-                break
-            if confirmed:
-                break
+    # ------------------------------------------------------------------
+    # Altitude readout — prefers SharedState, falls back to one-shot poll
+    # ------------------------------------------------------------------
 
-        if confirmed:
-            print("[DRONE] OFFBOARD mode confirmed ✓")
-        else:
-            raise RuntimeError(
-                "[DRONE] OFFBOARD mode not confirmed after offboard.start() — "
-                "PX4 rejected command 176. Check that EKF origin is set and "
-                "the drone is armed before calling this."
-            )
+    async def _read_alt(self):
+        """Returns altitude in meters above ground (NED: alt = -down)."""
+        if self.state is not None and self.state.latest_position is not None:
+            return -float(self.state.latest_position.down_m)
+        _, _, d = await self.get_position()
+        return -float(d)
 
-    async def arm_and_takeoff(self):
-        # Step 1: wait for EKF / pre-arm checks
+    # ------------------------------------------------------------------
+    # PURE OFFBOARD TAKEOFF
+    # action.takeoff() fails silently in GNSS-denied SITL (cmd ack returns
+    # but drone never lifts). The 20s sleep then triggers PX4's
+    # COM_DISARM_LAND auto-disarm, killing the gRPC channel. This bypass
+    # streams setpoints continuously from arm onward — no idle gap.
+    # ------------------------------------------------------------------
+
+    async def arm_and_takeoff(self, target_alt=1.8, ascent_timeout=30.0):
+        # Step 1: pre-arm
         print("[DRONE] Waiting for EKF / pre-arm checks...")
         ready = await self._wait_armable(timeout=90.0, stable_samples=8)
         if not ready:
@@ -118,72 +209,58 @@ class Drone:
                 "[DRONE] Timed out waiting for stable armable state. "
                 "Did you run: commander set_ekf_origin 47.397742 8.545594 488.0 ?"
             )
+        print("[DRONE] Pre-arm checks passed")
 
-        print("[DRONE] Pre-arm checks passed — arming")
-        await asyncio.sleep(2.0)
+        # Step 2: arm — must move quickly to OFFBOARD before COM_DISARM_LAND fires (~2s)
+        await self._arm_with_retry()
 
-        # Step 2: arm with retry — reconnect on gRPC UNAVAILABLE
-        last_exc = None
-        for attempt in range(3):
-            try:
-                await self.drone.action.arm()
-                last_exc = None
-                print(f"[DRONE] Arm attempt {attempt + 1}/3 succeeded")
+        # Step 3: pre-stream setpoints IMMEDIATELY (no sleep — keeps drone "active")
+        print("[DRONE] Pre-streaming OFFBOARD setpoints (1.5s @ 10 Hz)...")
+        await self._stream_zero_setpoints(count=15, interval=0.1)
+
+        # Step 4: enter OFFBOARD with telemetry confirmation
+        await self._start_offboard_with_confirm()
+
+        # Step 5: ascend via OFFBOARD velocity to target altitude
+        print(f"[DRONE] Ascending to {target_alt:.1f}m...")
+        deadline = asyncio.get_event_loop().time() + ascent_timeout
+        last_log = 0.0
+        while asyncio.get_event_loop().time() < deadline:
+            alt = await self._read_alt()
+            now = asyncio.get_event_loop().time()
+            if now - last_log >= 1.0:
+                print(f"[DRONE] altitude={alt:.2f}m / target={target_alt:.1f}m")
+                last_log = now
+            if alt >= target_alt - 0.2:
                 break
-            except Exception as e:
-                last_exc = e
-                err_str = str(e)
-                if attempt < 2:
-                    if "UNAVAILABLE" in err_str or "Connection reset" in err_str:
-                        print(f"[DRONE] Arm attempt {attempt + 1}/3 — gRPC lost, reconnecting...")
-                        await asyncio.sleep(2.0)
-                        await self.connect()
-                        await asyncio.sleep(2.0)
-                    else:
-                        print(f"[DRONE] Arm attempt {attempt + 1}/3 failed: {e} — retrying in 3s")
-                        await asyncio.sleep(3.0)
-
-        # Step 3: lost-ACK check
-        if last_exc:
-            armed = await self._is_armed_once()
-            if armed:
-                print("[DRONE] Arm ACK was lost but drone is armed — proceeding")
-            else:
-                raise last_exc
-
-        # Step 4: takeoff
-        print("[DRONE] Sending takeoff command...")
-        await self.drone.action.takeoff()
-        await asyncio.sleep(20)
-        print("[DRONE] Takeoff wait complete")
-
-        # Step 5: verify altitude — if still on ground, use OFFBOARD-based ascent
-        _, _, d = await self.get_position()
-        alt = -d  # NED: alt = -down, positive above ground
-        print(f"[DRONE] Post-takeoff altitude: {alt:.2f}m")
-
-        if alt < 0.5:
-            print(
-                f"[DRONE] WARNING: altitude {alt:.2f}m — action.takeoff() did not lift drone. "
-                "Attempting OFFBOARD manual ascent."
-            )
-            await self._enter_offboard()
-            for _ in range(80):  # 40 s max
-                _, _, d = await self.get_position()
-                if -d >= 1.5:
-                    break
+            try:
                 await self.drone.offboard.set_velocity_ned(
-                    VelocityNedYaw(0.0, 0.0, -0.5, 0.0)
+                    VelocityNedYaw(0.0, 0.0, -0.5, 0.0)  # NED: down=-0.5 → rising 0.5 m/s
                 )
-                await asyncio.sleep(0.5)
-            await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, 0.0))
-            await asyncio.sleep(1.0)
-            _, _, d = await self.get_position()
-            print(f"[DRONE] OFFBOARD ascent complete — altitude={-d:.2f}m")
-            return  # already in OFFBOARD, done
+            except Exception as e:
+                if _is_grpc_lost(e):
+                    print("[DRONE] Ascent — gRPC lost, reconnecting & resuming OFFBOARD")
+                    await asyncio.sleep(1.0)
+                    await self.connect()
+                    await asyncio.sleep(1.0)
+                    await self._stream_zero_setpoints(count=10)
+                    await self._start_offboard_with_confirm()
+                else:
+                    raise
+            await asyncio.sleep(0.1)
 
-        # Step 6: enter OFFBOARD normally (action.takeoff succeeded)
-        await self._enter_offboard()
+        # Step 6: hover hold (1s of zero-velocity to settle)
+        for _ in range(10):
+            await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, 0.0))
+            await asyncio.sleep(0.1)
+
+        final_alt = await self._read_alt()
+        if final_alt < target_alt - 0.5:
+            raise RuntimeError(
+                f"[DRONE] Ascent timed out — only reached {final_alt:.2f}m "
+                f"of {target_alt:.1f}m target."
+            )
+        print(f"[DRONE] Takeoff complete — altitude={final_alt:.2f}m, OFFBOARD active")
 
     async def land(self):
         try:
@@ -193,7 +270,10 @@ class Drone:
         await self.drone.action.land()
         await asyncio.sleep(10)
         print("land")
-        await self.drone.action.disarm()
+        try:
+            await self.drone.action.disarm()
+        except Exception:
+            pass
 
     async def get_position(self):
         async for pos in self.drone.telemetry.position_velocity_ned():
@@ -203,35 +283,32 @@ class Drone:
         async for att in self.drone.telemetry.attitude_euler():
             return att.yaw_deg
 
-    async def send_velocity(self, vx, vy, vz,yaw_deg):
-         await self.drone.offboard.set_velocity_ned(VelocityNedYaw(north_m_s=vx, east_m_s=vy, down_m_s=vz, yaw_deg=yaw_deg))
+    async def send_velocity(self, vx, vy, vz, yaw_deg):
+        await self.drone.offboard.set_velocity_ned(
+            VelocityNedYaw(north_m_s=vx, east_m_s=vy, down_m_s=vz, yaw_deg=yaw_deg)
+        )
 
     async def send_position_setpoint(self, north, east, down, yaw_deg):
-        await self.drone.offboard.set_position_ned(PositionNedYaw(north_m=north, east_m=east, down_m=down, yaw_deg=yaw_deg))
+        await self.drone.offboard.set_position_ned(
+            PositionNedYaw(north_m=north, east_m=east, down_m=down, yaw_deg=yaw_deg)
+        )
 
     async def rotate_to_yaw(self, target_yaw_deg, tolerance=2.0):
         """
-        Rotate to target yaw while holding current NED position.
-        Uses position setpoints so the position controller fights drift
-        instead of velocity setpoints which allow momentum to carry the drone.
+        Rotate to target yaw while holding current NED position via position setpoints.
         """
         target_yaw_deg = self._normalize_yaw(target_yaw_deg)
         lock_n, lock_e, lock_d = await self.get_position()
 
-        for _ in range(40):  # 4 s max
+        for _ in range(40):
             current_yaw = await self.get_yaw()
             if abs(self._yaw_error(target_yaw_deg, current_yaw)) < tolerance:
                 break
             await self.send_position_setpoint(lock_n, lock_e, lock_d, target_yaw_deg)
             await asyncio.sleep(0.1)
 
-        # Final hold — keep sending until caller yields
         await self.send_position_setpoint(lock_n, lock_e, lock_d, target_yaw_deg)
         await asyncio.sleep(0.3)
-
-    # =========================
-    # 🚁 HIGH-LEVEL COMMANDS
-    # =========================
 
     async def turn_cw_90(self):
         current = await self.get_yaw()
@@ -247,16 +324,16 @@ class Drone:
 
     async def recovery_hover(self, north, east, down, yaw_deg):
         """Hold position in offboard mode for attitude to settle — no offboard stop."""
-        for _ in range(20):  # 2s at 10Hz
+        for _ in range(20):
             await self.drone.offboard.set_position_ned(
                 PositionNedYaw(north_m=north, east_m=east, down_m=down, yaw_deg=yaw_deg)
             )
             await asyncio.sleep(0.1)
 
-    async def rearm_and_takeoff(self, armable_timeout=30.0):
+    async def rearm_and_takeoff(self, armable_timeout=30.0, target_alt=1.8):
         """
-        Re-arm and take off after a crash. Assumes drone is on the ground and disarmed.
-        Re-enters OFFBOARD mode so the mission can resume immediately.
+        Re-arm and take off via pure OFFBOARD after a crash.
+        Same flow as arm_and_takeoff but with shorter armable timeout.
         """
         print("[DRONE] Waiting for re-armable state...")
         ready = await self._wait_armable(timeout=armable_timeout, stable_samples=4)
@@ -264,13 +341,25 @@ class Drone:
             raise RuntimeError("[DRONE] Drone not armable for re-attempt")
 
         print("[DRONE] Re-arming...")
-        await self.drone.action.arm()
-        await asyncio.sleep(1.0)
+        await self._arm_with_retry()
 
-        print("[DRONE] Re-taking off...")
-        await self.drone.action.takeoff()
-        await asyncio.sleep(20)
+        print("[DRONE] Re-streaming OFFBOARD setpoints...")
+        await self._stream_zero_setpoints(count=15, interval=0.1)
 
-        # Re-enter OFFBOARD mode
-        await self._enter_offboard()
-        print("[DRONE] Re-attempt airborne — OFFBOARD active")
+        await self._start_offboard_with_confirm()
+
+        print(f"[DRONE] Re-ascending to {target_alt:.1f}m...")
+        deadline = asyncio.get_event_loop().time() + 30.0
+        while asyncio.get_event_loop().time() < deadline:
+            alt = await self._read_alt()
+            if alt >= target_alt - 0.2:
+                break
+            await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, -0.5, 0.0))
+            await asyncio.sleep(0.1)
+
+        for _ in range(10):
+            await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, 0.0))
+            await asyncio.sleep(0.1)
+
+        final_alt = await self._read_alt()
+        print(f"[DRONE] Re-attempt airborne — altitude={final_alt:.2f}m, OFFBOARD active")
