@@ -475,12 +475,20 @@ class QualifierMission:
         t = LOOKAHEAD_DIST / dist
         return (pose["north"] + t * dn, pose["east"] + t * de, wp[2])
 
-    def _rotate_waypoints_to_most_open(self, waypoints):
+    async def _rotate_waypoints_to_most_open(self, waypoints):
         """
-        Pick starting WP whose approach path (from current position) has
-        the fewest obstacle points within 1.5 m of the straight line.
-        Prefers longer paths when obstacle counts are equal (open-space bias).
-        Falls back to nearest non-wall WP if obstacle map is empty.
+        Two-stage starting-WP selection:
+          Stage 1 — heuristic shortlist: rank by 1/(1+obs_count+0.05*path_len)
+                    with a 12m distance cap (fallback uncapped if no nearby WPs).
+          Stage 2 — RRT* validation: run RRT* in parallel for the top 5
+                    heuristic candidates. Pick the WP with a valid, shortest
+                    planned path. Falls back to heuristic winner if all RRT*
+                    fail (e.g. empty obstacle map).
+
+        Why two stages: 360-scan map is sparse (~100 points). Heuristic score
+        alone says nothing about *reachability* — a "low obs_count" path may
+        still cross between pillars the scan didn't catch. RRT* exposes
+        unreachable WPs before the drone wastes time crashing into them.
         """
         p = self._pose()
         if p is None or not waypoints:
@@ -494,24 +502,18 @@ class QualifierMission:
             key=lambda i: math.hypot(waypoints[i][0] - cur_n, waypoints[i][1] - cur_e)
         )
 
-        best_idx = None
-        best_score = -1.0
-
-        # Two-pass: first try WPs within 12 m (prefer nearby clear paths); if
-        # none qualify (e.g. spawned far from all WPs) fall back to all WPs.
+        # Stage 1 — heuristic shortlist (12m cap, uncapped fallback)
+        candidates = []   # list of (idx, score, path_len)
         for dist_cap in (12.0, float("inf")):
             for idx in order:
                 wp = waypoints[idx]
                 if self._is_near_wall(wp[0], wp[1], extra=0.5):
                     continue
-
                 path_n = wp[0] - cur_n
                 path_e = wp[1] - cur_e
                 path_len = math.hypot(path_n, path_e) + 1e-6
-
                 if path_len > dist_cap:
                     continue
-
                 if obs_pts.shape[0] > 0:
                     t = np.clip(
                         ((obs_pts[:, 0] - cur_n) * path_n + (obs_pts[:, 1] - cur_e) * path_e)
@@ -524,28 +526,121 @@ class QualifierMission:
                     obs_count = int(np.sum(dists_to_path < 1.5))
                 else:
                     obs_count = 0
-
-                # Higher score = more open + closer
                 score = 1.0 / (1.0 + obs_count + 0.05 * path_len)
-                if score > best_score:
-                    best_score = score
-                    best_idx = idx
+                candidates.append((idx, score, path_len))
+            if candidates:
+                break
 
-            if best_idx is not None:
-                break  # found a good nearby WP — skip the uncapped pass
-
-        if best_idx is None:
-            # All WPs near wall — fall back to nearest non-wall or first
+        if not candidates:
+            # All WPs filtered out — fall back to nearest non-wall, then to order[0]
             for idx in order:
                 if not self._is_near_wall(waypoints[idx][0], waypoints[idx][1], extra=0.0):
                     best_idx = idx
                     break
             else:
                 best_idx = order[0]
+            wp = waypoints[best_idx]
+            print(f"[NAV] All-wall fallback start: WP {best_idx} N={wp[0]:.1f} E={wp[1]:.1f}")
+            return waypoints[best_idx:] + waypoints[:best_idx]
 
-        wp = waypoints[best_idx]
-        print(f"[NAV] Open-space start: WP {best_idx} N={wp[0]:.1f} E={wp[1]:.1f} score={best_score:.1f}")
+        # Stage 2 — validate top 5 heuristic candidates with RRT* in parallel
+        candidates.sort(key=lambda c: -c[1])  # highest score first
+        top_k = candidates[:5]
+
+        bounds = np.array([[self._n_min, self._n_max], [self._e_min, self._e_max]])
+        if obs_pts.shape[0] == 0:
+            obs_for_rrt = np.array([[self._n_max + 100, self._e_max + 100]])
+        else:
+            obs_for_rrt = obs_pts
+
+        async def _plan_one(idx, wp):
+            try:
+                path = await asyncio.to_thread(
+                    self._rrt.plan,
+                    [cur_n, cur_e],
+                    [wp[0], wp[1]],
+                    obs_for_rrt,
+                    bounds,
+                )
+                return (idx, path)
+            except Exception as e:
+                print(f"[NAV] RRT* validation WP {idx} threw: {e}")
+                return (idx, None)
+
+        print(f"[NAV] Validating top {len(top_k)} WP candidates with RRT*...")
+        results = await asyncio.gather(
+            *[_plan_one(c[0], waypoints[c[0]]) for c in top_k]
+        )
+
+        valid = []
+        for idx, path in results:
+            if path is None or len(path) < 2:
+                continue
+            total = 0.0
+            for i in range(len(path) - 1):
+                total += math.hypot(path[i+1][0] - path[i][0], path[i+1][1] - path[i][1])
+            valid.append((idx, total))
+
+        if valid:
+            valid.sort(key=lambda v: v[1])
+            best_idx, best_len = valid[0]
+            wp = waypoints[best_idx]
+            print(
+                f"[NAV] RRT*-validated start: WP {best_idx} "
+                f"N={wp[0]:.1f} E={wp[1]:.1f} path={best_len:.1f}m "
+                f"({len(valid)}/{len(top_k)} candidates feasible)"
+            )
+        else:
+            best_idx = candidates[0][0]
+            wp = waypoints[best_idx]
+            print(
+                f"[NAV] All {len(top_k)} RRT* validations failed — "
+                f"heuristic start: WP {best_idx} N={wp[0]:.1f} E={wp[1]:.1f}"
+            )
+
         return waypoints[best_idx:] + waypoints[:best_idx]
+
+    async def _plan_first_leg(self):
+        """RRT* from current pose to current WP 0. Inserts intermediate
+        sub-WPs at index 0 so the drone navigates around known obstacles
+        for the first leg instead of going straight — direct paths often run
+        into pillars between spawn and the first WP."""
+        if not self._waypoints:
+            return False
+        p = self._pose()
+        if p is None:
+            return False
+
+        target_wp = self._waypoints[0]
+        obs_pts = self.mapper.get_global_points()
+        if obs_pts.shape[0] == 0:
+            obs_pts = np.array([[self._n_max + 100, self._e_max + 100]])
+        bounds = np.array([[self._n_min, self._n_max], [self._e_min, self._e_max]])
+
+        try:
+            path = await asyncio.to_thread(
+                self._rrt.plan,
+                [p["north"], p["east"]],
+                [target_wp[0], target_wp[1]],
+                obs_pts,
+                bounds,
+            )
+        except Exception as e:
+            print(f"[NAV] First-leg RRT* threw: {e}")
+            return False
+
+        if path is None or len(path) <= 2:
+            print("[NAV] First-leg RRT* trivial path — using direct route")
+            return False
+
+        alt_d = target_wp[2]
+        intermediate = [(float(pt[0]), float(pt[1]), alt_d) for pt in path[1:-1]]
+        if not intermediate:
+            return False
+
+        self._waypoints = intermediate + self._waypoints
+        print(f"[NAV] First-leg planned: {len(intermediate)} sub-WPs inserted before WP 0")
+        return True
 
     # ------------------------------------------------------------------
     # Startup 360° scan — rotate relative to current yaw and seed GlobalMapper
@@ -705,27 +800,29 @@ class QualifierMission:
         # Background plan for the leg AFTER the one we just started
         self._start_rrt_plan(self._wp_idx, self._wp_idx + 1)
 
-    def _start_phase(self, phase):
+    async def _start_phase(self, phase):
         self._phase = phase
         if phase == "YELLOW":
             wps = self._build_zone_sweep(ALT_YELLOW, ROW_SPACING_LOW)
-            self._waypoints = self._rotate_waypoints_to_most_open(wps)
+            self._waypoints = await self._rotate_waypoints_to_most_open(wps)
             print(f"\n[PHASE 1] Yellow sweep  alt={ALT_YELLOW}m  "
                   f"{len(self._waypoints)} waypoints")
         else:
             wps = self._build_zone_sweep(ALT_RED, ROW_SPACING_HIGH)
-            self._waypoints = self._rotate_waypoints_to_most_open(wps)
+            self._waypoints = await self._rotate_waypoints_to_most_open(wps)
             print(f"\n[PHASE 2] Red sweep  alt={ALT_RED}m  "
                   f"{len(self._waypoints)} waypoints")
         self._wp_idx        = 0
         self._yellow_streak = 0
         self._red_streak    = 0
         self._reset_stuck()
+        # Plan first leg (current pose → selected WP) — inserts sub-WPs at index 0
+        await self._plan_first_leg()
         wp = self._current_wp()
         if wp:
             print(f"[NAV] WP 1/{len(self._waypoints)}  "
                   f"N={wp[0]:.1f} E={wp[1]:.1f} Alt={-wp[2]:.1f}m")
-        # Pre-plan first leg in background — will be ready by the time we arrive at WP 0
+        # Pre-plan next leg in background
         self._start_rrt_plan(0, 1)
 
     # ------------------------------------------------------------------
@@ -1216,7 +1313,7 @@ class QualifierMission:
             if self._phase == "YELLOW":
                 print(f"\n[PHASE 1 DONE] {self.tracker.summary()}")
                 if self._time_left() > 90:
-                    self._start_phase("RED")
+                    await self._start_phase("RED")
                 else:
                     print("[MISSION] Not enough time for red sweep.")
                     self._state = MissionState.DONE
@@ -1762,7 +1859,7 @@ class QualifierMission:
         print(f"[FSM] {self._state.value}")
         await self._startup_scan()
 
-        self._start_phase("YELLOW")
+        await self._start_phase("YELLOW")
         self._start_time = time.monotonic()
         self._reset_stuck()
         self._state = MissionState.EXPLORE
