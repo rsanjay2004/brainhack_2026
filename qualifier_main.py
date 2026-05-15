@@ -241,6 +241,7 @@ class QualifierMission:
         self._restart_count = 0
         self._was_in_offboard = False   # set True once we've entered offboard; gates crash detection
         self._was_flipped = False       # set True while flipping; triggers re-arm check when it clears
+        self._flip_count = 0            # consecutive flips at current WP; resets on WP advance
 
         # RRT* path planner (Phase 2)
         self._rrt = RRTStarPlanner(
@@ -668,6 +669,7 @@ class QualifierMission:
         self._reset_stuck()
         if self._consecutive_stuck > 0:
             self._consecutive_stuck = 0   # arriving at any WP = made progress
+        self._flip_count = 0
         wp = self._current_wp()
         if wp:
             print(f"[NAV] WP {self._wp_idx}/{len(self._waypoints)}  "
@@ -1010,8 +1012,13 @@ class QualifierMission:
         all_critical = (left_clearance < CRIT_DIST and center_clearance < CRIT_DIST
                         and right_clearance < CRIT_DIST)
 
+        # Use minimum clearance across all sectors for speed and avoidance weight.
+        # Corner clips happen because center is clear but a side is close — using
+        # center-only let the drone fly full speed into a wall corner.
+        min_clearance = min(center_clearance, left_clearance, right_clearance)
+
         # In open space, reduce avoidance weight so goal vector dominates
-        w_avoid = 0.1 if center_clearance >= SAFE_DIST else W_AVOID
+        w_avoid = 0.1 if min_clearance >= SAFE_DIST else W_AVOID
 
         # Blend: goal + avoidance + memory + wall
         if all_critical:
@@ -1039,12 +1046,11 @@ class QualifierMission:
         if not (math.isfinite(blend_n) and math.isfinite(blend_e)):
             return 0.0, 0.0, 0.0, cur_yaw
 
-        # --- Speed scaling based on forward clearance ---
-        # Reduces speed near obstacles; full speed in open space
-        if center_clearance >= SAFE_DIST:
+        # --- Speed scaling based on minimum clearance across all sectors ---
+        if min_clearance >= SAFE_DIST:
             speed = VEL_MAX
-        elif center_clearance > CRIT_DIST:
-            t = (center_clearance - CRIT_DIST) / (SAFE_DIST - CRIT_DIST)
+        elif min_clearance > CRIT_DIST:
+            t = (min_clearance - CRIT_DIST) / (SAFE_DIST - CRIT_DIST)
             speed = VEL_MIN + t * (VEL_MAX - VEL_MIN)
         else:
             speed = VEL_MIN
@@ -1365,13 +1371,47 @@ class QualifierMission:
     # ------------------------------------------------------------------
     async def _attempt_restart(self):
         self._restart_count += 1
-        print(f"[RECOVERY] Crash detected — restart attempt {self._restart_count}/{MAX_RESTARTS}")
+        print(f"[RECOVERY] Restart attempt {self._restart_count}/{MAX_RESTARTS}")
 
         if self._restart_count > MAX_RESTARTS:
             print("[RECOVERY] Max restarts reached — ending mission")
             self._state = MissionState.DONE
             return
 
+        # ── Stage 1: stop OFFBOARD so PX4 switches to HOLD/LAND ─────────
+        print("[RECOVERY] Stage 1 — stopping OFFBOARD")
+        try:
+            await self.drone.drone.offboard.stop()
+        except Exception as e:
+            print(f"[RECOVERY]   offboard.stop() failed (ignored): {e}")
+        await asyncio.sleep(1.0)
+
+        # ── Stage 2: land if airborne ────────────────────────────────────
+        p = self._pose()
+        alt_m = (-p["down"]) if (p is not None) else 0.0
+        if alt_m > 0.3:
+            print(f"[RECOVERY] Stage 2 — airborne ({alt_m:.1f}m), commanding land")
+            try:
+                await self.drone.drone.action.land()
+            except Exception as e:
+                print(f"[RECOVERY]   land() failed (ignored): {e}")
+            # Wait up to 20 s for altitude to drop below 0.2 m
+            for _ in range(40):
+                await asyncio.sleep(0.5)
+                p = self._pose()
+                alt_m = (-p["down"]) if (p is not None) else 0.0
+                if alt_m < 0.2:
+                    break
+            print(f"[RECOVERY]   landed (alt={alt_m:.2f}m)")
+        else:
+            print("[RECOVERY] Stage 2 — already on ground, skipping land")
+
+        # ── Stage 3: wait for disarm / PX4 settle ────────────────────────
+        print("[RECOVERY] Stage 3 — waiting for disarm / settle (3 s)")
+        await asyncio.sleep(3.0)
+
+        # ── Stage 4: re-arm and take off ─────────────────────────────────
+        print("[RECOVERY] Stage 4 — re-arm and takeoff")
         try:
             await self.drone.rearm_and_takeoff()
         except Exception as e:
@@ -1387,6 +1427,7 @@ class QualifierMission:
 
         # Reset stuck detection from new position; stay in current phase/waypoint
         self._reset_stuck()
+        self._flip_count = 0
         self._was_in_offboard = False   # will flip back True once telemetry confirms OFFBOARD
         print(f"[RECOVERY] Airborne again — resuming phase={self._phase} WP={self._wp_idx}")
 
@@ -1432,21 +1473,31 @@ class QualifierMission:
                 await asyncio.sleep(0.5)
                 continue
 
-            # Flip just cleared — check if drone is grounded (crashed) rather than recovered in air
+            # Flip just cleared — two-tier recovery
             if self._was_flipped:
                 self._was_flipped = False
+                self._flip_count += 1
                 p = self._pose()
-                grounded = (
-                    not self.state.is_armed
-                    or not self.state.is_in_offboard
-                    or (p is not None and p["down"] > -0.3)
+                alt_m = (-p["down"]) if (p is not None) else 0.0
+                armed = self.state.is_armed
+                offboard = self.state.is_in_offboard
+
+                # Hard recovery: disarmed / OFFBOARD lost / crashed to ground /
+                # or repeated flips at same WP (stuck in tight space even if airborne)
+                hard = (
+                    not armed
+                    or not offboard
+                    or alt_m < 0.5
+                    or self._flip_count >= 2
                 )
-                if grounded:
+
+                if hard:
                     print(
-                        f"[RECOVERY] Drone upright but grounded "
-                        f"(armed={self.state.is_armed} offboard={self.state.is_in_offboard}) "
-                        f"— initiating re-arm"
+                        f"[RECOVERY] Hard recovery "
+                        f"(alt={alt_m:.1f}m armed={armed} offboard={offboard} "
+                        f"flips@wp={self._flip_count}) — land + re-arm"
                     )
+                    self._flip_count = 0
                     if self._restart_count < MAX_RESTARTS:
                         await self._attempt_restart()
                     else:
@@ -1454,7 +1505,16 @@ class QualifierMission:
                         self._state = MissionState.DONE
                     continue
                 else:
-                    print("[RECOVERY] Flip recovered in air — resuming mission")
+                    # Soft recovery: hold position 3 s to let drone stabilise
+                    # before resuming velocity commands, preventing immediate re-collision
+                    print(
+                        f"[RECOVERY] Soft recovery flip #{self._flip_count} "
+                        f"(alt={alt_m:.1f}m) — holding 3s then resuming"
+                    )
+                    await self.drone.send_position_setpoint(
+                        p["north"], p["east"], p["down"], p["yaw_deg"]
+                    )
+                    await asyncio.sleep(3.0)
 
             # OFFBOARD persistence watchdog (Phase B):
             # If PX4 drops OFFBOARD mid-mission while armed and airborne, attempt
