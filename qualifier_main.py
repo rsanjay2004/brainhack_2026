@@ -222,6 +222,9 @@ class QualifierMission:
         # BOUNDARY log throttle — print at most once per 2 s
         self._boundary_log_time = 0.0
 
+        # OFFBOARD gate warn throttle
+        self._offboard_warn_time = 0.0
+
         # Crash recovery (Phase 4)
         self._restart_count = 0
         self._was_in_offboard = False   # set True once we've entered offboard; gates crash detection
@@ -434,21 +437,68 @@ class QualifierMission:
         near_e = e > self._e_max - WALL_MARGIN
         return (near_s or near_n) and (near_w or near_e)
 
-    def _rotate_waypoints_to_nearest(self, waypoints):
+    def _rotate_waypoints_to_most_open(self, waypoints):
+        """
+        Pick starting WP whose approach path (from current position) has
+        the fewest obstacle points within 1.5 m of the straight line.
+        Prefers longer paths when obstacle counts are equal (open-space bias).
+        Falls back to nearest non-wall WP if obstacle map is empty.
+        """
         p = self._pose()
         if p is None or not waypoints:
             return waypoints
-        dists = [math.hypot(wp[0] - p["north"], wp[1] - p["east"]) for wp in waypoints]
-        # Skip any WP within extra=0.1m of any single wall, not just corners
-        order = sorted(range(len(waypoints)), key=lambda i: dists[i])
+
+        cur_n, cur_e = p["north"], p["east"]
+        obs_pts = self.mapper.get_global_points()
+
+        order = sorted(
+            range(len(waypoints)),
+            key=lambda i: math.hypot(waypoints[i][0] - cur_n, waypoints[i][1] - cur_e)
+        )
+
+        best_idx = None
+        best_score = -1.0
+
         for idx in order:
             wp = waypoints[idx]
-            if not self._is_near_wall(wp[0], wp[1], extra=0.5):
-                nearest = idx
-                break
-        else:
-            nearest = order[0]  # all near-wall — fall back to closest
-        return waypoints[nearest:] + waypoints[:nearest]
+            if self._is_near_wall(wp[0], wp[1], extra=0.5):
+                continue
+
+            path_n = wp[0] - cur_n
+            path_e = wp[1] - cur_e
+            path_len = math.hypot(path_n, path_e) + 1e-6
+
+            if obs_pts.shape[0] > 0:
+                t = np.clip(
+                    ((obs_pts[:, 0] - cur_n) * path_n + (obs_pts[:, 1] - cur_e) * path_e)
+                    / (path_len ** 2),
+                    0.0, 1.0,
+                )
+                closest_n = cur_n + t * path_n
+                closest_e = cur_e + t * path_e
+                dists_to_path = np.hypot(obs_pts[:, 0] - closest_n, obs_pts[:, 1] - closest_e)
+                obs_count = int(np.sum(dists_to_path < 1.5))
+            else:
+                obs_count = 0
+
+            # Higher score = more open + farther (prefer reaching deep into open space)
+            score = path_len / (1.0 + obs_count)
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+
+        if best_idx is None:
+            # All WPs near wall — fall back to nearest non-wall or first
+            for idx in order:
+                if not self._is_near_wall(waypoints[idx][0], waypoints[idx][1], extra=0.0):
+                    best_idx = idx
+                    break
+            else:
+                best_idx = order[0]
+
+        wp = waypoints[best_idx]
+        print(f"[NAV] Open-space start: WP {best_idx} N={wp[0]:.1f} E={wp[1]:.1f} score={best_score:.1f}")
+        return waypoints[best_idx:] + waypoints[:best_idx]
 
     # ------------------------------------------------------------------
     # Startup 360° scan — rotate relative to current yaw and seed GlobalMapper
@@ -599,12 +649,12 @@ class QualifierMission:
         self._phase = phase
         if phase == "YELLOW":
             wps = self._build_zone_sweep(ALT_YELLOW, ROW_SPACING_LOW)
-            self._waypoints = self._rotate_waypoints_to_nearest(wps)
+            self._waypoints = self._rotate_waypoints_to_most_open(wps)
             print(f"\n[PHASE 1] Yellow sweep  alt={ALT_YELLOW}m  "
                   f"{len(self._waypoints)} waypoints")
         else:
             wps = self._build_zone_sweep(ALT_RED, ROW_SPACING_HIGH)
-            self._waypoints = self._rotate_waypoints_to_nearest(wps)
+            self._waypoints = self._rotate_waypoints_to_most_open(wps)
             print(f"\n[PHASE 2] Red sweep  alt={ALT_RED}m  "
                   f"{len(self._waypoints)} waypoints")
         self._wp_idx        = 0
@@ -632,6 +682,12 @@ class QualifierMission:
     def _check_stuck(self):
         p = self._pose()
         if p is None:
+            return False
+        # Only fire stuck when drone is confirmed airborne in OFFBOARD.
+        # A grounded drone is motionless by definition — not "stuck".
+        if not self.state.is_in_offboard:
+            return False
+        if p["down"] > -0.3:  # NED: down < 0 when above ground; -0.3 = ~30 cm
             return False
         moved = math.hypot(p["north"] - self._stuck_ref_n,
                            p["east"]  - self._stuck_ref_e)
@@ -1143,6 +1199,23 @@ class QualifierMission:
                     continue
                 else:
                     print("[RECOVERY] Flip recovered in air — resuming mission")
+
+            # OFFBOARD gate: if PX4 is not in OFFBOARD during active navigation,
+            # our velocity/position commands are silently ignored. Pause navigation
+            # and wait — a re-arm or operator action will restore the mode.
+            if (not self.state.is_in_offboard
+                    and self._state in (MissionState.EXPLORE, MissionState.ESCAPE)):
+                _now = time.monotonic()
+                if _now - self._offboard_warn_time > 5.0:
+                    p = self._pose()
+                    alt = -p["down"] if p else 0.0
+                    print(
+                        f"[WARN] Not in OFFBOARD (armed={self.state.is_armed} "
+                        f"alt={alt:.2f}m) — pausing navigation"
+                    )
+                    self._offboard_warn_time = _now
+                await asyncio.sleep(max(0.0, dt - (time.monotonic() - t0)))
+                continue
 
             handler = _dispatch.get(self._state)
             if handler is not None:

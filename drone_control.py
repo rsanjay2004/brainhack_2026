@@ -74,6 +74,41 @@ class Drone:
             return bool(is_armed)
         return False
 
+    async def _enter_offboard(self):
+        """
+        Pre-stream velocity setpoints at 5 Hz for 2 s, then call offboard.start().
+        PX4 requires a continuous setpoint stream before accepting the mode switch —
+        sending just one setpoint then immediately calling start() causes command-176 rejection.
+        Polls flight_mode() for up to 5 s to confirm OFFBOARD actually engaged.
+        Raises RuntimeError if mode is not confirmed.
+        """
+        print("[DRONE] Entering OFFBOARD mode — pre-streaming setpoints for 2 s...")
+        for _ in range(10):
+            await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, 0.0))
+            await asyncio.sleep(0.2)
+
+        await self.drone.offboard.start()
+
+        # Poll telemetry to confirm mode switch (up to 5 s)
+        confirmed = False
+        for _ in range(10):
+            await asyncio.sleep(0.5)
+            async for mode in self.drone.telemetry.flight_mode():
+                if "OFFBOARD" in str(mode).upper():
+                    confirmed = True
+                break
+            if confirmed:
+                break
+
+        if confirmed:
+            print("[DRONE] OFFBOARD mode confirmed ✓")
+        else:
+            raise RuntimeError(
+                "[DRONE] OFFBOARD mode not confirmed after offboard.start() — "
+                "PX4 rejected command 176. Check that EKF origin is set and "
+                "the drone is armed before calling this."
+            )
+
     async def arm_and_takeoff(self):
         # Step 1: wait for EKF / pre-arm checks
         print("[DRONE] Waiting for EKF / pre-arm checks...")
@@ -116,15 +151,39 @@ class Drone:
             else:
                 raise last_exc
 
-        # Step 4: takeoff and enter offboard
+        # Step 4: takeoff
+        print("[DRONE] Sending takeoff command...")
         await self.drone.action.takeoff()
         await asyncio.sleep(20)
-        print("Takeoff")
+        print("[DRONE] Takeoff wait complete")
 
-        await self.drone.offboard.set_velocity_ned(
-            VelocityNedYaw(0.0, 0.0, 0.0, 0.0)
-        )
-        await self.drone.offboard.start()
+        # Step 5: verify altitude — if still on ground, use OFFBOARD-based ascent
+        _, _, d = await self.get_position()
+        alt = -d  # NED: alt = -down, positive above ground
+        print(f"[DRONE] Post-takeoff altitude: {alt:.2f}m")
+
+        if alt < 0.5:
+            print(
+                f"[DRONE] WARNING: altitude {alt:.2f}m — action.takeoff() did not lift drone. "
+                "Attempting OFFBOARD manual ascent."
+            )
+            await self._enter_offboard()
+            for _ in range(80):  # 40 s max
+                _, _, d = await self.get_position()
+                if -d >= 1.5:
+                    break
+                await self.drone.offboard.set_velocity_ned(
+                    VelocityNedYaw(0.0, 0.0, -0.5, 0.0)
+                )
+                await asyncio.sleep(0.5)
+            await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, 0.0))
+            await asyncio.sleep(1.0)
+            _, _, d = await self.get_position()
+            print(f"[DRONE] OFFBOARD ascent complete — altitude={-d:.2f}m")
+            return  # already in OFFBOARD, done
+
+        # Step 6: enter OFFBOARD normally (action.takeoff succeeded)
+        await self._enter_offboard()
 
     async def land(self):
         try:
@@ -213,8 +272,5 @@ class Drone:
         await asyncio.sleep(20)
 
         # Re-enter OFFBOARD mode
-        await self.drone.offboard.set_velocity_ned(
-            VelocityNedYaw(0.0, 0.0, 0.0, 0.0)
-        )
-        await self.drone.offboard.start()
+        await self._enter_offboard()
         print("[DRONE] Re-attempt airborne — OFFBOARD active")
