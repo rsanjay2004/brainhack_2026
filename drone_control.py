@@ -180,3 +180,28 @@ class Drone:
                 PositionNedYaw(north_m=north, east_m=east, down_m=down, yaw_deg=yaw_deg)
             )
             await asyncio.sleep(0.1)
+
+    async def rearm_and_takeoff(self, armable_timeout=30.0):
+        """
+        Re-arm and take off after a crash. Assumes drone is on the ground and disarmed.
+        Re-enters OFFBOARD mode so the mission can resume immediately.
+        """
+        print("[DRONE] Waiting for re-armable state...")
+        ready = await self._wait_armable(timeout=armable_timeout, stable_samples=4)
+        if not ready:
+            raise RuntimeError("[DRONE] Drone not armable for re-attempt")
+
+        print("[DRONE] Re-arming...")
+        await self.drone.action.arm()
+        await asyncio.sleep(1.0)
+
+        print("[DRONE] Re-taking off...")
+        await self.drone.action.takeoff()
+        await asyncio.sleep(20)
+
+        # Re-enter OFFBOARD mode
+        await self.drone.offboard.set_velocity_ned(
+            VelocityNedYaw(0.0, 0.0, 0.0, 0.0)
+        )
+        await self.drone.offboard.start()
+        print("[DRONE] Re-attempt airborne — OFFBOARD active")

@@ -15,23 +15,26 @@ class GlobalMapper:
     Incremental top-down occupancy grid mapper using NED (North-East-Down) pose.
 
     Coordinate Conventions:
-    - Pose: {'north': float, 'east': float, 'yaw': float}
+    - Pose: {'north': float, 'east': float, 'down': float, 'yaw': float,
+             'roll_deg': float (optional), 'pitch_deg': float (optional)}
     - Yaw: radians, clockwise from North (standard NED heading)
     - Camera: Forward-facing, level mount assumed (X_cam=right, Z_cam=forward)
-    - Grid: row=North, col=East (matches standard map orientation)
+    - cam_height is read live from pose['down'] each frame (-down = altitude).
+      The constructor cam_height is a fallback when pose lacks 'down'.
     """
     def __init__(self, K,
                  cam_height=1.0, obs_h_min=0.1, obs_h_max=1.5,
                  z_min=0.2, z_max=15.0,
-                 yaw_in_degrees=False, yaw_clockwise=True, yaw_smoothing=0.7):
+                 yaw_in_degrees=False, yaw_clockwise=True, yaw_smoothing=0.3,
+                 subsample=4):
         self.K = K
-        self.cam_height = cam_height
+        self._default_cam_height = cam_height
         self.obs_h_min = obs_h_min
         self.obs_h_max = obs_h_max
         self.z_min = z_min
         self.z_max = z_max
+        self.subsample = subsample
 
-        # Yaw handling
         self.yaw_in_degrees = yaw_in_degrees
         self.yaw_clockwise = yaw_clockwise
         self.yaw_smoothing = yaw_smoothing
@@ -63,9 +66,14 @@ class GlobalMapper:
         return points[idx]
 
     def _local_to_ned_global(self, local_xy, north, east, yaw_rad):
-        """Transform local (X_cam=right, Z_cam=forward) to NED global (north, east)."""
-        X_cam = local_xy[:, 0]
-        Z_cam = local_xy[:, 1]
+        """
+        Transform body-frame (east_body, north_body) to NED global (north, east).
+
+        local_xy[:, 0] = east_body  (lateral right, GlobalMapper X_cam convention)
+        local_xy[:, 1] = north_body (forward,        GlobalMapper Z_cam convention)
+        """
+        X_cam = local_xy[:, 0]   # east_body
+        Z_cam = local_xy[:, 1]   # north_body
         c, s = np.cos(yaw_rad), np.sin(yaw_rad)
         north_global = north + Z_cam * c - X_cam * s
         east_global  = east  + Z_cam * s + X_cam * c
@@ -80,7 +88,14 @@ class GlobalMapper:
         east    = pose['east']
         raw_yaw = pose['yaw']
 
-        # 1. Yaw conversion & smoothing
+        # Live altitude from pose (NED: down < 0 means above ground)
+        cam_height = max(0.3, -float(pose.get('down', -self._default_cam_height)))
+
+        # Attitude compensation — degrees from SharedState, convert to radians
+        roll_rad  = math.radians(float(pose.get('roll_deg',  0.0)))
+        pitch_rad = math.radians(float(pose.get('pitch_deg', 0.0)))
+
+        # Yaw conversion & smoothing
         if self.yaw_in_degrees:
             raw_yaw = np.deg2rad(raw_yaw)
         if not self.yaw_clockwise:
@@ -95,38 +110,33 @@ class GlobalMapper:
         self.last_yaw_rad = raw_yaw
         yaw = raw_yaw
 
-        # 2. Sanitize depth before projection
         depth_clean = self._sanitize_depth(depth_img)
 
-        # 3. Extract local obstacle coordinates
         xy_obstacles = depth_to_xy_map(
             depth_clean, self.K,
-            cam_height=self.cam_height,
+            cam_height=cam_height,
             obs_h_min=self.obs_h_min,
             obs_h_max=self.obs_h_max,
             z_min=self.z_min,
             z_max=self.z_max,
+            roll_rad=roll_rad,
+            pitch_rad=pitch_rad,
+            subsample=self.subsample,
         )
 
         if xy_obstacles.shape[0] == 0:
             return False
 
-        # 4. Transform to global NED
         global_pts = self._local_to_ned_global(xy_obstacles, north, east, yaw)
 
-        # 5. Drop any non-finite points produced by bad pose or projection
         valid = np.isfinite(global_pts).all(axis=1)
         global_pts = global_pts[valid]
         if global_pts.shape[0] == 0:
             return False
 
-        # 6. Accumulate
         self.global_points = np.vstack([self.global_points, global_pts])
-
-        # 7. Spatial deduplication — one point per VOXEL_SIZE cell
         self.global_points = self._voxel_filter(self.global_points)
 
-        # 8. Hard cap — keep most recent MAX_POINTS if exceeded
         if self.global_points.shape[0] > MAX_POINTS:
             self.global_points = self.global_points[-MAX_POINTS:]
 
@@ -149,7 +159,6 @@ class GlobalMapper:
         if self.global_points.shape[0] == 0:
             return 0.0, 0.0
 
-        # Drop any corrupted points before computing repulsion
         valid = np.isfinite(self.global_points).all(axis=1)
         pts = self.global_points[valid]
         if pts.shape[0] == 0:
@@ -202,8 +211,8 @@ async def run():
     time.sleep(5)
 
     mapper = GlobalMapper(
-        K, cam_height=1.0, obs_h_min=0.1, obs_h_max=1.5,
-        yaw_in_degrees=True, yaw_smoothing=1.0, z_min=0.3, z_max=5.0
+        K, obs_h_min=0.1, obs_h_max=1.5,
+        yaw_in_degrees=True, yaw_smoothing=0.3, z_min=0.3, z_max=5.0
     )
 
     fig, ax = plt.subplots(figsize=(8, 8))
@@ -221,10 +230,12 @@ async def run():
 
     for i in range(3):
         pose = {
-            'yaw':   state.latest_yaw,
-            'north': state.latest_position.north_m,
-            'east':  state.latest_position.east_m,
-            'down':  state.latest_position.down_m,
+            'yaw':       state.latest_yaw,
+            'north':     state.latest_position.north_m,
+            'east':      state.latest_position.east_m,
+            'down':      state.latest_position.down_m,
+            'roll_deg':  state.latest_roll  or 0.0,
+            'pitch_deg': state.latest_pitch or 0.0,
         }
         depth_img = receiver.get_frame()
         if depth_img is None:

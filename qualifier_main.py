@@ -14,11 +14,13 @@ from AvoidancePlanner import AvoidancePlanner
 from get_position_with_task import SharedState, position_monitor_task
 from barrel_detector import BarrelDetector, DetectionTracker
 from GlobalMapper import GlobalMapper
+from RRTStarPlanner import RRTStarPlanner
 
 DEPTH_TOPIC = "/depth_camera"
 
-# L-shaped arena zone offsets from spawn NED (m)
-# Map: world origin bottom-left; drone spawns ~N=4 E=12
+# ── Arena geometry ── swap this entire block when official map is released ───
+# All coordinates are spawn-relative NED (N=North offset, E=East offset), meters.
+# Drone spawns at approx N=4, E=12 in world frame; geometry is spawn-relative.
 # Zone 1 — main floor (bottom section of L)
 ZONE1_N = (-4.0, 16.0)
 ZONE1_E = (-12.0, 16.0)
@@ -32,15 +34,41 @@ ZONE3_E = (12.0, 28.0)
 FORBIDDEN_N = (16.0, 36.0)
 FORBIDDEN_E = (0.0, 12.0)
 
-WALL_MARGIN = 2.5   # stay this far from walls at all times
+# Physical wall segments as ((n1,e1),(n2,e2)) pairs, spawn-relative.
+# Used for continuous geometric repulsion (works regardless of camera FOV).
+ARENA_WALL_SEGS_REL = [
+    ((-4.0, -12.0), (-4.0,  16.0)),   # south wall
+    ((-4.0,  16.0), (16.0,  16.0)),   # Zone1 east wall
+    ((16.0,  16.0), (16.0,  28.0)),   # Zone3 south step (E=16→E=28 at N=16)
+    ((16.0,  28.0), (32.0,  28.0)),   # Zone3 east wall
+    ((32.0,  28.0), (32.0,  12.0)),   # Zone3 north wall
+    ((32.0,  12.0), (16.0,  12.0)),   # cutout right inner wall (N=32→N=16 at E=12)
+    ((16.0,  12.0), (16.0,   0.0)),   # cutout bottom (N=16 at E=0→E=12)
+    ((16.0,   0.0), (32.0,   0.0)),   # cutout left inner wall (N=16→N=32 at E=0)
+    ((32.0,   0.0), (32.0, -12.0)),   # Zone2 north wall
+    ((32.0, -12.0), (-4.0, -12.0)),   # west wall
+]
+
+WALL_MARGIN  = 2.5   # stay this far from walls at all times
+W_WALL       = 0.5   # continuous geometric wall repulsion weight
+WALL_INF_M   = 3.5   # wall influence radius (m) > WALL_MARGIN so repulsion starts before margin
+# ─────────────────────────────────────────────────────────────────────────────
+
+# RRT* path planning — runs once per waypoint leg in a background thread
+RRT_MAX_ITER = 500    # iterations per plan (balances quality vs latency)
+RRT_SAFETY_M = 1.0   # obstacle clearance margin (m)
+RRT_STEP_M   = 1.5   # tree extension step size (m)
+
+# Crash recovery (Phase 4)
+MAX_RESTARTS = 2      # max re-attempts within the 10-minute window
 
 # Altitudes
 ALT_YELLOW = 1.8    # low — ground-level yellow barrels visible in lower frame
 ALT_RED    = 4.5    # high — elevated red barrels come into camera FOV
 
-# Lawnmower row spacing
-ROW_SPACING_LOW  = 3.0
-ROW_SPACING_HIGH = 5.0
+# Row spacing — wider than camera sightline since detection runs during flight
+ROW_SPACING_LOW  = 5.0   # was 3.0 — at 1.8m alt camera sees ~5m ahead
+ROW_SPACING_HIGH = 7.0   # was 5.0 — at 4.5m alt camera sees further
 
 CONTROL_HZ     = 20.0
 ARRIVAL_RADIUS = 1.0    # horizontal arrival threshold (m)
@@ -48,7 +76,6 @@ ARRIVAL_ALT    = 0.5    # vertical arrival threshold (m)
 MISSION_LIMIT  = 600.0  # s — 10 min hard cap
 
 # Virtual target blending
-LOOK_AHEAD  = 1.5   # m
 W_AVOID     = 0.5   # depth-camera avoidance weight
 W_MEM_AVOID = 0.3   # memory map avoidance weight
 
@@ -61,6 +88,13 @@ MAP_RETENTION_M = 15.0
 MAP_INFLUENCE_M = 4.5
 MAP_Z_MAX = 10.0
 
+# Velocity setpoint limits (Phase 1)
+VEL_MAX      = 1.0   # m/s — open space cruise speed
+VEL_MIN      = 0.3   # m/s — near obstacles / boundary recovery
+YAW_RATE_MAX = 15.0  # deg per control tick — prevents snapping to face a wall
+ALT_KP       = 2.0   # P-gain for altitude velocity controller
+ALT_VEL_MAX  = 0.5   # m/s — max vertical correction speed
+
 # Stuck detection
 STUCK_TIMEOUT_S = 10.0
 STUCK_DIST_M = 0.4
@@ -71,8 +105,8 @@ DETECT_CONFIRM = 2
 
 MERGE_DIST = 3.0
 
-# Map update throttle: update every N explore ticks
-MAP_THROTTLE = 3
+# Map update throttle: update every N explore ticks (depth_to_xy_map subsamples 4x so cost is low)
+MAP_THROTTLE = 5
 
 # Visited grid
 CELL_SIZE     = 2.0          # m — grid cell resolution
@@ -142,14 +176,14 @@ class QualifierMission:
 
         self.mapper = GlobalMapper(
             K=CAM_K,
-            cam_height=ALT_YELLOW,
             obs_h_min=0.1,
             obs_h_max=2.0,
             z_min=0.3,
             z_max=MAP_Z_MAX,
             yaw_in_degrees=True,
             yaw_clockwise=True,
-            yaw_smoothing=0.8,
+            yaw_smoothing=0.3,
+            subsample=4,
         )
 
         self._state = MissionState.INIT
@@ -185,6 +219,22 @@ class QualifierMission:
         # AVOID log throttle — print at most 1/s (every 20 ticks at 20 Hz)
         self._avoid_log_tick = 0
 
+        # Crash recovery (Phase 4)
+        self._restart_count = 0
+        self._was_in_offboard = False   # set True once we've entered offboard; gates crash detection
+
+        # RRT* path planner (Phase 2)
+        self._rrt = RRTStarPlanner(
+            safety_margin=RRT_SAFETY_M,
+            step_size=RRT_STEP_M,
+            max_iter=RRT_MAX_ITER,
+        )
+        self._rrt_task = None    # asyncio.Task for the background plan
+        self._rrt_for_wp = -1   # wp index the pending plan targets
+
+        # Wall segments in global NED (populated after spawn origin is known)
+        self._wall_segs = []
+
     # ------------------------------------------------------------------
     # Time
     # ------------------------------------------------------------------
@@ -204,11 +254,13 @@ class QualifierMission:
             return None
 
         return {
-            "north": float(self.state.latest_position.north_m),
-            "east": float(self.state.latest_position.east_m),
-            "down": float(self.state.latest_position.down_m),
-            "yaw": math.radians(float(self.state.latest_yaw)),
-            "yaw_deg": float(self.state.latest_yaw),
+            "north":     float(self.state.latest_position.north_m),
+            "east":      float(self.state.latest_position.east_m),
+            "down":      float(self.state.latest_position.down_m),
+            "yaw":       math.radians(float(self.state.latest_yaw)),
+            "yaw_deg":   float(self.state.latest_yaw),
+            "roll_deg":  float(self.state.latest_roll  or 0.0),
+            "pitch_deg": float(self.state.latest_pitch or 0.0),
         }
 
     # ------------------------------------------------------------------
@@ -287,7 +339,16 @@ class QualifierMission:
     def _cell_key(self, pose):
         return self._ned_to_cell(pose["north"], pose["east"])
 
+    def _build_wall_segments(self):
+        """Translate spawn-relative wall segments to global NED using spawn origin."""
+        self._wall_segs = [
+            ((self._origin_n + n1, self._origin_e + e1),
+             (self._origin_n + n2, self._origin_e + e2))
+            for (n1, e1), (n2, e2) in ARENA_WALL_SEGS_REL
+        ]
+
     def _init_grid(self):
+        self._build_wall_segments()
         self._grid = [[GridCell() for _ in range(GRID_E_CELLS)] for _ in range(GRID_N_CELLS)]
         blocked = 0
         for ci in range(GRID_N_CELLS):
@@ -297,6 +358,9 @@ class QualifierMission:
                     self._grid[ci][cj].blocked = True
                     self._grid[ci][cj].scan_done = True
                     blocked += 1
+                else:
+                    # Phase 3: detection runs every tick during flight — no stop-and-scan needed
+                    self._grid[ci][cj].scan_done = True
         navigable = GRID_N_CELLS * GRID_E_CELLS - blocked
         print(
             f"[GRID] {GRID_N_CELLS}×{GRID_E_CELLS} grid  "
@@ -422,12 +486,9 @@ class QualifierMission:
         print(f"[SCAN] Done — {len(pts)} obstacle points in initial map")
 
     # ------------------------------------------------------------------
-    # Detection — only runs during SCAN state, phase-gated, cell-deduped
+    # Detection — runs every tick, phase-gated, cell-deduped
     # ------------------------------------------------------------------
     def _run_detection(self):
-        if self._state != MissionState.SCAN:
-            return
-
         p = self._pose()
         if p is None:
             return
@@ -527,6 +588,8 @@ class QualifierMission:
                   f"N={wp[0]:.1f} E={wp[1]:.1f} Alt={-wp[2]:.1f}m  "
                   f"T={self._time_left():.0f}s  {self.tracker.summary()}  "
                   f"{self._coverage_summary()}")
+        # Background plan for the leg AFTER the one we just started
+        self._start_rrt_plan(self._wp_idx, self._wp_idx + 1)
 
     def _start_phase(self, phase):
         self._phase = phase
@@ -548,6 +611,8 @@ class QualifierMission:
         if wp:
             print(f"[NAV] WP 1/{len(self._waypoints)}  "
                   f"N={wp[0]:.1f} E={wp[1]:.1f} Alt={-wp[2]:.1f}m")
+        # Pre-plan first leg in background — will be ready by the time we arrive at WP 0
+        self._start_rrt_plan(0, 1)
 
     # ------------------------------------------------------------------
     # Stuck detection
@@ -597,18 +662,116 @@ class QualifierMission:
         self._reset_stuck()
 
     # ------------------------------------------------------------------
-    # Virtual target blending — goal + avoidance + memory
+    # Wall repulsion — geometric, FOV-independent (Phase 2)
     # ------------------------------------------------------------------
-    def _compute_setpoint(self, pose, target_n, target_e, target_d, depth):
-        cur_n, cur_e = pose["north"], pose["east"]
+    @staticmethod
+    def _nearest_on_seg(n, e, n1, e1, n2, e2):
+        dn, de = n2 - n1, e2 - e1
+        seg_sq = dn * dn + de * de
+        if seg_sq < 1e-9:
+            return n1, e1
+        t = max(0.0, min(1.0, ((n - n1) * dn + (e - e1) * de) / seg_sq))
+        return n1 + t * dn, e1 + t * de
 
-        # Emergency: near wall/forbidden — push to zone 1 centre
+    def _compute_wall_repulsion(self, n, e):
+        """Unit repulsion vector from all wall segments within WALL_INF_M."""
+        rep_n, rep_e = 0.0, 0.0
+        for (n1, e1), (n2, e2) in self._wall_segs:
+            wn, we = self._nearest_on_seg(n, e, n1, e1, n2, e2)
+            dist = math.hypot(n - wn, e - we)
+            if 1e-3 < dist < WALL_INF_M:
+                t = 1.0 - dist / WALL_INF_M   # linear falloff to 0 at influence radius
+                rep_n += t * (n - wn) / dist
+                rep_e += t * (e - we) / dist
+        mag = math.hypot(rep_n, rep_e)
+        if mag < 1e-6:
+            return 0.0, 0.0
+        return rep_n / mag, rep_e / mag
+
+    # ------------------------------------------------------------------
+    # RRT* background path planning (Phase 2)
+    # ------------------------------------------------------------------
+    def _start_rrt_plan(self, from_idx, to_idx):
+        """Launch background RRT* plan for the leg from_idx → to_idx."""
+        if to_idx >= len(self._waypoints):
+            return
+        from_wp = self._waypoints[from_idx]
+        to_wp   = self._waypoints[to_idx]
+        obs_snap = self.mapper.get_global_points().copy()
+
+        n_min, n_max = self._n_min, self._n_max
+        e_min, e_max = self._e_min, self._e_max
+        rrt = self._rrt
+
+        def _plan_sync():
+            # KDTree needs ≥1 point; use a dummy far away when map is empty
+            if obs_snap.shape[0] == 0:
+                obs_pts = np.array([[n_max + 100, e_max + 100]])
+            else:
+                obs_pts = obs_snap
+            bounds = np.array([[n_min, n_max], [e_min, e_max]])
+            return rrt.plan(
+                start=[from_wp[0], from_wp[1]],
+                goal=[to_wp[0], to_wp[1]],
+                obstacle_points=obs_pts,
+                bounds=bounds,
+            )
+
+        if self._rrt_task is not None and not self._rrt_task.done():
+            self._rrt_task.cancel()
+
+        self._rrt_for_wp = to_idx
+        self._rrt_task = asyncio.create_task(asyncio.to_thread(_plan_sync))
+
+    def _try_apply_rrt_plan(self):
+        """If a background plan is ready for wp_idx+1, insert its intermediate points."""
+        if (self._rrt_task is None
+                or not self._rrt_task.done()
+                or self._rrt_for_wp != self._wp_idx + 1):
+            return
+        try:
+            path = self._rrt_task.result()
+        except Exception:
+            self._rrt_task = None
+            return
+        self._rrt_task = None
+
+        if path is None or len(path) <= 2:
+            return  # RRT* failed or path is trivial — use direct leg
+
+        target_wp = self._waypoints[self._rrt_for_wp]
+        alt_d = target_wp[2]
+        # path[0] = start (current WP, already visited), path[-1] = goal (already in list)
+        intermediate = [(float(pt[0]), float(pt[1]), alt_d) for pt in path[1:-1]]
+        if intermediate:
+            self._waypoints = (
+                self._waypoints[:self._rrt_for_wp]
+                + intermediate
+                + self._waypoints[self._rrt_for_wp:]
+            )
+            print(f"[RRT*] Inserted {len(intermediate)} sub-WPs before WP {self._rrt_for_wp}")
+
+    # ------------------------------------------------------------------
+    # Velocity setpoint — goal + avoidance + memory + wall blend → (vn, ve, vd, yaw)
+    # ------------------------------------------------------------------
+    def _compute_velocity_setpoint(self, pose, target_n, target_e, target_d, depth):
+        cur_n, cur_e = pose["north"], pose["east"]
+        cur_yaw = pose["yaw_deg"]
+
+        # Emergency: near wall/forbidden — push toward zone 1 centre at VEL_MIN
         if self._is_near_wall(cur_n, cur_e, extra=0.5):
             safe_n = self._origin_n + (ZONE1_N[0] + ZONE1_N[1]) / 2.0
             safe_e = self._origin_e + (ZONE1_E[0] + ZONE1_E[1]) / 2.0
-            yaw = math.degrees(math.atan2(safe_e - cur_e, safe_n - cur_n))
+            dn = safe_n - cur_n
+            de = safe_e - cur_e
+            mag = math.hypot(dn, de)
+            if mag > 1e-3:
+                dn /= mag
+                de /= mag
+            yaw = math.degrees(math.atan2(de, dn))
+            vd = max(-ALT_VEL_MAX, min(ALT_VEL_MAX, ALT_KP * (target_d - pose["down"])))
             print(f"[BOUNDARY] Near wall/forbidden at N={cur_n:.1f} E={cur_e:.1f} — recovering")
-            return safe_n, safe_e, target_d, yaw
+            return VEL_MIN * dn, VEL_MIN * de, vd, yaw
 
         # Goal vector toward current waypoint
         dn   = target_n - cur_n
@@ -646,28 +809,30 @@ class QualifierMission:
         if not (math.isfinite(mem_n) and math.isfinite(mem_e)):
             mem_n, mem_e = 0.0, 0.0
 
-        # All three sectors critical — random histogram direction unreliable;
-        # use memory repulsion to escape known obstacle cluster
+        # Geometric wall repulsion — always active, no camera FOV dependency
+        wall_n, wall_e = self._compute_wall_repulsion(cur_n, cur_e)
+
+        # All three sectors critical — use memory repulsion to escape obstacle cluster
         all_critical = (left_clearance < CRIT_DIST and center_clearance < CRIT_DIST
                         and right_clearance < CRIT_DIST)
 
         # In open space, reduce avoidance weight so goal vector dominates
         w_avoid = 0.1 if center_clearance >= SAFE_DIST else W_AVOID
 
-        # Blend: goal + avoidance + memory
+        # Blend: goal + avoidance + memory + wall
         if all_critical:
             if abs(mem_n) > 1e-3 or abs(mem_e) > 1e-3:
-                blend_n = mem_n
-                blend_e = mem_e
+                blend_n = mem_n + W_WALL * wall_n
+                blend_e = mem_e + W_WALL * wall_e
             else:
-                blend_n = avoid_n
-                blend_e = avoid_e
+                blend_n = avoid_n + W_WALL * wall_n
+                blend_e = avoid_e + W_WALL * wall_e
         elif blocked:
-            blend_n = avoid_n + W_MEM_AVOID * mem_n
-            blend_e = avoid_e + W_MEM_AVOID * mem_e
+            blend_n = avoid_n + W_MEM_AVOID * mem_n + W_WALL * wall_n
+            blend_e = avoid_e + W_MEM_AVOID * mem_e + W_WALL * wall_e
         else:
-            blend_n = goal_n + w_avoid * avoid_n + W_MEM_AVOID * mem_n
-            blend_e = goal_e + w_avoid * avoid_e + W_MEM_AVOID * mem_e
+            blend_n = goal_n + w_avoid * avoid_n + W_MEM_AVOID * mem_n + W_WALL * wall_n
+            blend_e = goal_e + w_avoid * avoid_e + W_MEM_AVOID * mem_e + W_WALL * wall_e
 
         mag = math.hypot(blend_n, blend_e)
         if mag > 1e-3:
@@ -676,34 +841,45 @@ class QualifierMission:
         else:
             blend_n, blend_e = goal_n, goal_e
 
-        # Dynamic look-ahead: expand in open space, shrink near obstacles/post-escape
+        # Guard: abort to hover if blend is non-finite
+        if not (math.isfinite(blend_n) and math.isfinite(blend_e)):
+            return 0.0, 0.0, 0.0, cur_yaw
+
+        # --- Speed scaling based on forward clearance ---
+        # Reduces speed near obstacles; full speed in open space
         if center_clearance >= SAFE_DIST:
-            look_ahead = min(4.0, center_clearance * 0.8)  # faster in open space
+            speed = VEL_MAX
+        elif center_clearance > CRIT_DIST:
+            t = (center_clearance - CRIT_DIST) / (SAFE_DIST - CRIT_DIST)
+            speed = VEL_MIN + t * (VEL_MAX - VEL_MIN)
         else:
-            look_ahead = LOOK_AHEAD
-        if dist < 3.0:
-            look_ahead = min(look_ahead, dist * 0.5)
-        if center_clearance < SAFE_DIST:
-            look_ahead = min(look_ahead, center_clearance * 0.4)
-        time_since_escape = time.monotonic() - self._last_escape_time
-        if time_since_escape < 4.0:
-            look_ahead = min(look_ahead, 0.6)
-        look_ahead = max(look_ahead, 0.3)
+            speed = VEL_MIN
 
-        raw_n = cur_n + look_ahead * blend_n
-        raw_e = cur_e + look_ahead * blend_e
+        # Slow down as we approach the waypoint (last 1.5m)
+        if dist < 1.5:
+            speed = min(speed, dist * (VEL_MAX / 1.5))
+        speed = max(speed, VEL_MIN)
 
-        # Abort to hover if result is non-finite
-        if not (math.isfinite(raw_n) and math.isfinite(raw_e)):
-            return cur_n, cur_e, target_d, pose["yaw_deg"]
+        # Slow down briefly after an escape maneuver
+        if time.monotonic() - self._last_escape_time < 4.0:
+            speed = min(speed, VEL_MIN)
 
-        send_n, send_e = self._clamp(raw_n, raw_e)
+        vn = speed * blend_n
+        ve = speed * blend_e
 
-        yaw_deg = math.degrees(math.atan2(blend_e, blend_n))
-        if not math.isfinite(yaw_deg):
-            yaw_deg = pose["yaw_deg"]
+        # --- Altitude P-controller ---
+        # NED: down < 0 when above ground; positive vd moves toward ground
+        vd = max(-ALT_VEL_MAX, min(ALT_VEL_MAX, ALT_KP * (target_d - pose["down"])))
 
-        return send_n, send_e, target_d, yaw_deg
+        # --- Yaw rate limit — prevents snapping to face a wall in one tick ---
+        desired_yaw = math.degrees(math.atan2(blend_e, blend_n))
+        if not math.isfinite(desired_yaw):
+            desired_yaw = cur_yaw
+        yaw_error = ((desired_yaw - cur_yaw + 180.0) % 360.0) - 180.0
+        yaw_step  = max(-YAW_RATE_MAX, min(YAW_RATE_MAX, yaw_error))
+        commanded_yaw = cur_yaw + yaw_step
+
+        return vn, ve, vd, commanded_yaw
 
     # ------------------------------------------------------------------
     # STABILIZE: block until pose + yaw + depth are all valid
@@ -764,26 +940,11 @@ class QualifierMission:
         cur_n = pose["north"]
         cur_e = pose["east"]
 
-        # Track visited cells (streak-based scan trigger preserved for backward compat)
         self._update_grid(pose)
 
-        # Arrived at waypoint — trigger SCAN if cell not yet scanned, else advance
         if self._arrived(wp):
-            ci, cj = self._ned_to_cell(cur_n, cur_e)
-            if (self._grid is not None
-                    and self._valid_cell(ci, cj)
-                    and not self._grid[ci][cj].scan_done):
-                print("[FSM] EXPLORE → SCAN (arrived at unscanned cell)")
-                self._state = MissionState.SCAN
-                return
+            self._try_apply_rrt_plan()
             self._advance_wp()
-            return
-
-        # Emergency boundary recovery
-        if self._is_near_wall(cur_n, cur_e, extra=0.5):
-            safe_n = self._origin_n + (ZONE1_N[0] + ZONE1_N[1]) / 2.0
-            safe_e = self._origin_e + (ZONE1_E[0] + ZONE1_E[1]) / 2.0
-            await self.drone.send_position_setpoint(safe_n, safe_e, wp[2], 0.0)
             return
 
         if self._check_stuck():
@@ -802,17 +963,14 @@ class QualifierMission:
             self.mapper.update_frame(depth, pose)
             self.mapper.prune(cur_n, cur_e, MAP_RETENTION_M)
 
-        send_n, send_e, send_d, yaw_deg = self._compute_setpoint(
+        # Detection every tick — no stop-and-scan required (Phase 3)
+        self._run_detection()
+
+        vn, ve, vd, yaw_deg = self._compute_velocity_setpoint(
             pose, target_n, target_e, target_d, depth
         )
 
-        # Hover in place if setpoint computation returned current position (invalid result)
-        if send_n == cur_n and send_e == cur_e:
-            return
-
-        await self.drone.send_position_setpoint(
-            north=send_n, east=send_e, down=send_d, yaw_deg=yaw_deg
-        )
+        await self.drone.send_velocity(vn, ve, vd, yaw_deg)
 
     # ------------------------------------------------------------------
     # State tick: SCAN
@@ -889,6 +1047,36 @@ class QualifierMission:
         self._state = MissionState.EXPLORE
 
     # ------------------------------------------------------------------
+    # Crash recovery — re-arm, re-takeoff, resume mission (Phase 4)
+    # ------------------------------------------------------------------
+    async def _attempt_restart(self):
+        self._restart_count += 1
+        print(f"[RECOVERY] Crash detected — restart attempt {self._restart_count}/{MAX_RESTARTS}")
+
+        if self._restart_count > MAX_RESTARTS:
+            print("[RECOVERY] Max restarts reached — ending mission")
+            self._state = MissionState.DONE
+            return
+
+        try:
+            await self.drone.rearm_and_takeoff()
+        except Exception as e:
+            print(f"[RECOVERY] Re-takeoff failed: {e} — ending mission")
+            self._state = MissionState.DONE
+            return
+
+        # Wait for telemetry to re-populate after re-takeoff
+        for _ in range(50):
+            if self.state.latest_position is not None:
+                break
+            await asyncio.sleep(0.1)
+
+        # Reset stuck detection from new position; stay in current phase/waypoint
+        self._reset_stuck()
+        self._was_in_offboard = False   # will flip back True once telemetry confirms OFFBOARD
+        print(f"[RECOVERY] Airborne again — resuming phase={self._phase} WP={self._wp_idx}")
+
+    # ------------------------------------------------------------------
     # Dispatch-table control loop
     # ------------------------------------------------------------------
     async def _control_loop(self):
@@ -896,7 +1084,6 @@ class QualifierMission:
 
         _dispatch = {
             MissionState.EXPLORE: self._tick_explore,
-            MissionState.SCAN:    self._tick_scan,
             MissionState.ESCAPE:  self._tick_escape,
         }
 
@@ -905,7 +1092,22 @@ class QualifierMission:
         while self._state not in (MissionState.DONE, MissionState.LAND):
             t0 = time.monotonic()
 
-            # Flip detection: hold position so attitude settles (no offboard stop)
+            # Track when we first enter OFFBOARD — gates crash detection
+            if self.state.is_in_offboard:
+                self._was_in_offboard = True
+
+            # Crash detection: was in OFFBOARD, now out + disarmed = crashed and grounded.
+            # Only fires during active mission states (not during escape/recovery spin-up).
+            if (self._was_in_offboard
+                    and not self.state.is_in_offboard
+                    and not self.state.is_armed
+                    and self._state in (MissionState.EXPLORE,
+                                        MissionState.SCAN,
+                                        MissionState.ESCAPE)):
+                await self._attempt_restart()
+                continue
+
+            # Flip detection: hold position so attitude can settle
             if self.state.is_flipped:
                 roll  = self.state.latest_roll  or 0.0
                 pitch = self.state.latest_pitch or 0.0
@@ -924,9 +1126,8 @@ class QualifierMission:
             else:
                 print(f"[FSM] No handler for state {self._state.value} — idling one tick")
 
-            sleep_t = dt - (time.monotonic() - t0)
-            if sleep_t > 0:
-                await asyncio.sleep(sleep_t)
+            # Always yield to event loop so gz-transport callbacks drain (fixes 6.3)
+            await asyncio.sleep(max(0.0, dt - (time.monotonic() - t0)))
 
         print(f"[FSM] Control loop exited — final state: {self._state.value}")
 
