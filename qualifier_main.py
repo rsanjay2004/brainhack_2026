@@ -1110,7 +1110,7 @@ class QualifierMission:
     # SAFE CENTERING: move to Zone 1 geometric center before sweep
     # Avoids spawn-corner trap when spawn is near a wall.
     # ------------------------------------------------------------------
-    async def _safe_centering(self, timeout=10.0):
+    async def _safe_centering(self, timeout=15.0):
         safe_n = self._origin_n + (ZONE1_N[0] + ZONE1_N[1]) / 2.0
         safe_e = self._origin_e + (ZONE1_E[0] + ZONE1_E[1]) / 2.0
         safe_d = -ALT_YELLOW
@@ -1131,7 +1131,7 @@ class QualifierMission:
                 continue
             horiz = math.hypot(p["north"] - safe_n, p["east"] - safe_e)
             vert  = abs(p["down"] - safe_d)
-            if horiz < 0.6 and vert < 0.4:
+            if horiz < 1.0 and vert < 0.6:
                 arrived = True
                 print(f"[CENTER] Arrived (horiz={horiz:.2f}m, vert={vert:.2f}m)")
                 break
@@ -1447,7 +1447,6 @@ class QualifierMission:
                         f"{self._offboard_recovery_count}/3"
                     )
                     try:
-                        await self.drone._stream_zero_setpoints(count=10, interval=0.1)
                         await self.drone._start_offboard_with_confirm(confirm_timeout=3.0)
                         print("[OFFBOARD-WD] Re-entered ✓")
                         self._offboard_lost_since = 0.0
@@ -1660,7 +1659,7 @@ async def main():
         print(f"[CONFIG] YOLO model: {model_path}")
     else:
         print("[CONFIG] No model — using HSV colour detection")
-        print("         Usage: python3 qualifier_main.py barrels.pt\n")
+        print("[INFO]   Tip: python3 qualifier_main.py barrels.pt  to enable YOLO\n")
 
     mission = QualifierMission(model_path)
     try:

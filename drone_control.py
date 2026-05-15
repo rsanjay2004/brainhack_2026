@@ -245,21 +245,30 @@ class Drone:
         # Step 4: enter OFFBOARD with telemetry confirmation
         await self._start_offboard_with_confirm()
 
-        # Step 5: ascend via OFFBOARD velocity to target altitude
+        # Step 5: ascend to target altitude via position setpoints.
+        # Velocity setpoints from ground are ignored by PX4's land detector;
+        # position setpoints go through the position controller which handles
+        # the ground→air transition correctly.
         print(f"[DRONE] Ascending to {target_alt:.1f}m...")
+        lock_n = float(self.state.latest_position.north_m) if (self.state and self.state.latest_position) else 0.0
+        lock_e = float(self.state.latest_position.east_m)  if (self.state and self.state.latest_position) else 0.0
+        lock_yaw = float(self.state.latest_yaw) if (self.state and self.state.latest_yaw) else 0.0
+
         deadline = asyncio.get_event_loop().time() + ascent_timeout
         last_log = 0.0
+        last_logged_alt = -999.0
         while asyncio.get_event_loop().time() < deadline:
             alt = await self._read_alt()
             now = asyncio.get_event_loop().time()
-            if now - last_log >= 1.0:
+            if abs(alt - last_logged_alt) > 0.2 or now - last_log >= 5.0:
                 print(f"[DRONE] altitude={alt:.2f}m / target={target_alt:.1f}m")
                 last_log = now
+                last_logged_alt = alt
             if alt >= target_alt - 0.2:
                 break
             try:
-                await self.drone.offboard.set_velocity_ned(
-                    VelocityNedYaw(0.0, 0.0, -0.5, 0.0)  # NED: down=-0.5 → rising 0.5 m/s
+                await self.drone.offboard.set_position_ned(
+                    PositionNedYaw(north_m=lock_n, east_m=lock_e, down_m=-target_alt, yaw_deg=lock_yaw)
                 )
             except Exception as e:
                 if _is_grpc_lost(e):
@@ -373,12 +382,22 @@ class Drone:
         await self._start_offboard_with_confirm()
 
         print(f"[DRONE] Re-ascending to {target_alt:.1f}m...")
+        lock_n = float(self.state.latest_position.north_m) if (self.state and self.state.latest_position) else 0.0
+        lock_e = float(self.state.latest_position.east_m)  if (self.state and self.state.latest_position) else 0.0
+        lock_yaw = float(self.state.latest_yaw) if (self.state and self.state.latest_yaw) else 0.0
+
         deadline = asyncio.get_event_loop().time() + 30.0
+        last_logged_alt = -999.0
         while asyncio.get_event_loop().time() < deadline:
             alt = await self._read_alt()
+            if abs(alt - last_logged_alt) > 0.2:
+                print(f"[DRONE] re-ascent altitude={alt:.2f}m / target={target_alt:.1f}m")
+                last_logged_alt = alt
             if alt >= target_alt - 0.2:
                 break
-            await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, -0.5, 0.0))
+            await self.drone.offboard.set_position_ned(
+                PositionNedYaw(north_m=lock_n, east_m=lock_e, down_m=-target_alt, yaw_deg=lock_yaw)
+            )
             await asyncio.sleep(0.1)
 
         for _ in range(10):
