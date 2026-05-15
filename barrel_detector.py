@@ -44,6 +44,11 @@ RED_UPPER2 = np.array([180, 255, 255])
 MIN_AREA_YELLOW = 300
 MIN_AREA_RED    = 200
 
+# Maximum contour area — rejects large decoy barrels (biohazard cylinders).
+# Target canisters are small; decoy barrels fill 5-10× more pixels at same distance.
+MAX_AREA_YELLOW = 4000
+MAX_AREA_RED    = 3000
+
 
 class BarrelDetector:
 
@@ -200,14 +205,14 @@ class BarrelDetector:
         # Phase-gate: only check the relevant colour — prevents cross-firing
         if phase.upper() == "YELLOW":
             yellow_mask = cv2.inRange(roi, YELLOW_LOWER, YELLOW_UPPER)
-            yellow = self._mask_has_object(yellow_mask, MIN_AREA_YELLOW)
+            yellow = self._mask_has_object(yellow_mask, MIN_AREA_YELLOW, MAX_AREA_YELLOW)
             red = False
         else:
             red_mask = cv2.bitwise_or(
                 cv2.inRange(roi, RED_LOWER1, RED_UPPER1),
                 cv2.inRange(roi, RED_LOWER2, RED_UPPER2),
             )
-            red = self._mask_has_object(red_mask, MIN_AREA_RED)
+            red = self._mask_has_object(red_mask, MIN_AREA_RED, MAX_AREA_RED)
             yellow = False
 
         detections: List[Dict[str, Any]] = []
@@ -225,7 +230,7 @@ class BarrelDetector:
             "detections": detections,
         }
 
-    def _mask_has_object(self, mask: np.ndarray, min_area: int) -> bool:
+    def _mask_has_object(self, mask: np.ndarray, min_area: int, max_area: int = 999999) -> bool:
         mask = cv2.medianBlur(mask, 5)
         kernel = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -234,13 +239,15 @@ class BarrelDetector:
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area < min_area:
+            if area < min_area or area > max_area:
                 continue
             x, y, w, h = cv2.boundingRect(cnt)
             if w <= 0 or h <= 0:
                 continue
             aspect = h / max(w, 1)
-            if 0.8 <= aspect <= 3.5:
+            # Target canisters are tall/narrow (aspect >= 1.3).
+            # Decoy barrels are roughly round (aspect ~1.0) — filtered out here.
+            if 1.3 <= aspect <= 3.5:
                 return True
         return False
     

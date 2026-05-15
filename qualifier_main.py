@@ -580,6 +580,9 @@ class QualifierMission:
         if self._yellow_streak >= DETECT_CONFIRM:
             if cell_key not in self._counted_cells["YELLOW"]:
                 self._counted_cells["YELLOW"].add(cell_key)
+                # Mark cell highly visited so navigator won't target it as a WP
+                if self._grid is not None and self._valid_cell(ci, cj):
+                    self._grid[ci][cj].visited_count = 999
                 if self.tracker.try_add_yellow(cell_n, cell_e):
                     print(
                         f"[DETECT] YELLOW #{self.tracker.yellow_count}  "
@@ -593,6 +596,9 @@ class QualifierMission:
         if self._red_streak >= DETECT_CONFIRM:
             if cell_key not in self._counted_cells["RED"]:
                 self._counted_cells["RED"].add(cell_key)
+                # Mark cell highly visited so navigator won't target it as a WP
+                if self._grid is not None and self._valid_cell(ci, cj):
+                    self._grid[ci][cj].visited_count = 999
                 if self.tracker.try_add_red(cell_n, cell_e):
                     print(
                         f"[DETECT] RED #{self.tracker.red_count}  "
@@ -869,7 +875,7 @@ class QualifierMission:
             if cell.blocked or cell.visited_count > 0:
                 continue
             cn, ce = self._cell_to_ned(ni, nj)
-            if self._is_near_wall(cn, ce, extra=0.0):
+            if self._is_near_wall(cn, ce, extra=1.0):
                 continue
             self._biased_cells.add(cell_key)
             inserted.append((cn, ce, down))
@@ -976,6 +982,12 @@ class QualifierMission:
                     cl = info["clearance"]
                     print(f"[AVOID] L={cl['left']:.1f} C={cl['center']:.1f} "
                           f"R={cl['right']:.1f}")
+
+        # Emergency stop: obstacle < 0.6 m ahead — halt horizontal motion.
+        # VEL_MIN (0.3 m/s) would otherwise keep driving the drone into the object.
+        if center_clearance < 0.6:
+            vd = max(-ALT_VEL_MAX, min(ALT_VEL_MAX, ALT_KP * (target_d - pose["down"])))
+            return 0.0, 0.0, vd, cur_yaw
 
         # Memory-map repulsion from GlobalMapper
         mem_n, mem_e = self.mapper.get_repulsion_vector(cur_n, cur_e, MAP_INFLUENCE_M)

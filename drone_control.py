@@ -390,6 +390,11 @@ class Drone:
         Re-arm and take off via pure OFFBOARD after a crash.
         Same flow as arm_and_takeoff but with shorter armable timeout.
         """
+        # Crash severs the gRPC channel — reconnect before anything else.
+        print("[DRONE] Reconnecting after crash...")
+        await self.connect()
+        await asyncio.sleep(2.0)
+
         print("[DRONE] Waiting for re-armable state...")
         ready = await self._wait_armable(timeout=armable_timeout, stable_samples=4)
         if not ready:
@@ -397,6 +402,14 @@ class Drone:
 
         print("[DRONE] Re-arming...")
         await self._arm_with_retry()
+
+        # HOLD mode gives PX4 a clean post-crash state before OFFBOARD entry.
+        # Without this, commander can still hold a crash-mode lockout.
+        try:
+            await self.drone.action.hold()
+            await asyncio.sleep(1.0)
+        except Exception:
+            pass
 
         print("[DRONE] Re-streaming OFFBOARD setpoints...")
         await self._stream_zero_setpoints(count=15, interval=0.1)
