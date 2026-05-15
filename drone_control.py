@@ -403,16 +403,33 @@ class Drone:
         print("[DRONE] Re-arming...")
         await self._arm_with_retry()
 
-        # HOLD mode gives PX4 a clean post-crash state before OFFBOARD entry.
-        # Without this, commander can still hold a crash-mode lockout.
+        # Clean any stale MAVSDK offboard RPC stream left over from the crash.
+        # offboard.start() on a stale stream silently fails; stop() resets it.
+        # action.hold() was previously here but sends MAV_CMD_DO_SET_MODE (176)
+        # on the ground → PX4 rejects → late ACK corrupts MAVSDK offboard state.
+        print("[DRONE] Resetting OFFBOARD state post-crash...")
         try:
-            await self.drone.action.hold()
-            await asyncio.sleep(1.0)
+            await self.drone.offboard.stop()
         except Exception:
             pass
+        await asyncio.sleep(0.5)
 
-        print("[DRONE] Re-streaming OFFBOARD setpoints...")
-        await self._stream_zero_setpoints(count=15, interval=0.1)
+        # Position pre-stream: more reliable than velocity on the ground post-crash.
+        # Velocity setpoints from ground are ignored by the land detector; position
+        # setpoints go through the position controller and keep the channel warm.
+        cur_n   = float(self.state.latest_position.north_m) if (self.state and self.state.latest_position) else 0.0
+        cur_e   = float(self.state.latest_position.east_m)  if (self.state and self.state.latest_position) else 0.0
+        cur_yaw = float(self.state.latest_yaw)              if (self.state and self.state.latest_yaw)      else 0.0
+        print("[DRONE] Pre-streaming POSITION setpoints for re-arm (3s)...")
+        for _ in range(30):
+            try:
+                await self.drone.offboard.set_position_ned(
+                    PositionNedYaw(north_m=cur_n, east_m=cur_e, down_m=0.0, yaw_deg=cur_yaw)
+                )
+            except Exception as e:
+                if _is_grpc_lost(e):
+                    await asyncio.sleep(0.5)
+            await asyncio.sleep(0.1)
 
         await self._start_offboard_with_confirm()
 

@@ -224,6 +224,9 @@ class QualifierMission:
         # BOUNDARY log throttle — print at most once per 2 s
         self._boundary_log_time = 0.0
 
+        # Boundary persistence WP skip — prevents infinite loop against forbidden zone
+        self._boundary_wp_stuck_ticks = 0
+
         # OFFBOARD gate warn throttle
         self._offboard_warn_time = 0.0
         # OFFBOARD persistence watchdog (Phase B)
@@ -1202,6 +1205,20 @@ class QualifierMission:
             self._state = MissionState.ESCAPE
             return
 
+        # Boundary persistence: if drone is wall-locked for >5s it means the
+        # current WP requires crossing the forbidden zone and boundary recovery
+        # alone can't resolve it. Skip the WP so the mission can progress.
+        if self._is_near_wall(cur_n, cur_e, extra=0.0):
+            self._boundary_wp_stuck_ticks += 1
+            if self._boundary_wp_stuck_ticks >= 100:  # 5s @ 20Hz
+                self._boundary_wp_stuck_ticks = 0
+                if self._wp_idx < len(self._waypoints) - 1:
+                    print(f"[BOUNDARY] Wall-locked 5s — skipping WP {self._wp_idx}")
+                    self._advance_wp()
+                return
+        else:
+            self._boundary_wp_stuck_ticks = 0
+
         target_n, target_e, target_d = wp
 
         # Sanitize depth before any planner/map use
@@ -1412,7 +1429,6 @@ class QualifierMission:
                 self._was_flipped = True
                 # Don't send position setpoints to a potentially crashed drone — just wait
                 await asyncio.sleep(0.5)
-                self._reset_stuck()
                 continue
 
             # Flip just cleared — check if drone is grounded (crashed) rather than recovered in air
