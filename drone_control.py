@@ -147,39 +147,63 @@ class Drone:
     async def _start_offboard_with_confirm(self, confirm_timeout=5.0):
         """
         Call offboard.start() and confirm OFFBOARD mode via telemetry.
+        Keeps a background setpoint stream alive at 20 Hz during the entire
+        mode-switch + confirmation window — PX4 rejects OFFBOARD if the
+        setpoint stream goes quiet even for ~500 ms (COM_OF_LOSS_T).
         Retries on gRPC loss. Raises RuntimeError if mode not confirmed.
         """
-        last_exc = None
-        for attempt in range(3):
+        keep_streaming = True
+
+        async def _background_stream():
+            while keep_streaming:
+                try:
+                    await self.drone.offboard.set_velocity_ned(
+                        VelocityNedYaw(0.0, 0.0, 0.0, 0.0)
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(0.05)  # 20 Hz
+
+        stream_task = asyncio.create_task(_background_stream())
+
+        try:
+            last_exc = None
+            for attempt in range(3):
+                try:
+                    await self.drone.offboard.start()
+                    last_exc = None
+                    break
+                except Exception as e:
+                    last_exc = e
+                    if _is_grpc_lost(e) and attempt < 2:
+                        print(f"[DRONE] offboard.start() {attempt+1}/3 — gRPC lost, reconnecting & re-streaming")
+                        await asyncio.sleep(1.0)
+                        await self.connect()
+                        await asyncio.sleep(1.0)
+                    else:
+                        raise
+            if last_exc:
+                raise last_exc
+
+            # Confirm OFFBOARD via SharedState (fast) or telemetry poll
+            deadline = asyncio.get_event_loop().time() + confirm_timeout
+            while asyncio.get_event_loop().time() < deadline:
+                if await self._in_offboard_now():
+                    print("[DRONE] OFFBOARD mode confirmed ✓")
+                    return
+                await asyncio.sleep(0.2)
+
+            raise RuntimeError(
+                "[DRONE] OFFBOARD mode not confirmed after offboard.start() — "
+                "PX4 rejected mode switch. Check armed state and EKF origin."
+            )
+        finally:
+            keep_streaming = False
+            stream_task.cancel()
             try:
-                await self.drone.offboard.start()
-                last_exc = None
-                break
-            except Exception as e:
-                last_exc = e
-                if _is_grpc_lost(e) and attempt < 2:
-                    print(f"[DRONE] offboard.start() {attempt+1}/3 — gRPC lost, reconnecting & re-streaming")
-                    await asyncio.sleep(1.0)
-                    await self.connect()
-                    await asyncio.sleep(1.0)
-                    await self._stream_zero_setpoints(count=10)
-                else:
-                    raise
-        if last_exc:
-            raise last_exc
-
-        # Confirm OFFBOARD via SharedState (fast) or telemetry poll
-        deadline = asyncio.get_event_loop().time() + confirm_timeout
-        while asyncio.get_event_loop().time() < deadline:
-            if await self._in_offboard_now():
-                print("[DRONE] OFFBOARD mode confirmed ✓")
-                return
-            await asyncio.sleep(0.2)
-
-        raise RuntimeError(
-            "[DRONE] OFFBOARD mode not confirmed after offboard.start() — "
-            "PX4 rejected mode switch. Check armed state and EKF origin."
-        )
+                await stream_task
+            except asyncio.CancelledError:
+                pass
 
     # ------------------------------------------------------------------
     # Altitude readout — prefers SharedState, falls back to one-shot poll
