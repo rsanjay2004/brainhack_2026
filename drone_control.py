@@ -192,9 +192,17 @@ class Drone:
                             await asyncio.sleep(1.0)
                             await self.connect()
                             await asyncio.sleep(1.0)
+                        elif attempt < 2:
+                            # NO_SETPOINT_SET or similar — re-stream and retry
+                            print(f"[DRONE] offboard.start() {attempt+1}/3 — {e} — re-streaming setpoints")
+                            await self._stream_zero_setpoints(count=10)
+                            await asyncio.sleep(0.3)
                         else:
-                            raise
-                if last_exc:
+                            break  # exhausted inner retries; outer loop re-streams
+                if last_exc is not None:
+                    if outer < MAX_OUTER - 1:
+                        print(f"[DRONE] offboard.start() failed ({last_exc}) — outer retry {outer+1}")
+                        continue  # go to next outer iteration which re-streams
                     raise last_exc
 
                 # Confirm OFFBOARD via SharedState (fast) or telemetry poll
