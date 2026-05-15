@@ -57,13 +57,13 @@ class Drone:
             except Exception:
                 consecutive = 0
             if consecutive >= stable_samples:
-                print(f"\r[EKF] Ready! ({elapsed:.1f}s)                              ")
+                print(f"\r\033[2K[EKF] Ready! ({elapsed:.1f}s)")
                 return True
             if now - last_print >= 2.0:
                 bar_len = 20
                 filled = int(bar_len * consecutive / stable_samples)
                 bar = "#" * filled + "-" * (bar_len - filled)
-                print(f"\r[EKF] Waiting [{bar}] {consecutive}/{stable_samples} | {elapsed:.0f}s elapsed | {remaining:.0f}s left", end="", flush=True)
+                print(f"\r\033[2K[EKF] Waiting [{bar}] {consecutive}/{stable_samples} | {elapsed:.0f}s elapsed | {remaining:.0f}s left", end="", flush=True)
                 last_print = now
             await asyncio.sleep(0.5)   # 2 Hz — prevents MAVLink ACK flooding
         print()  # newline after progress bar

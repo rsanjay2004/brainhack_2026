@@ -219,9 +219,13 @@ class QualifierMission:
         # AVOID log throttle — print at most 1/s (every 20 ticks at 20 Hz)
         self._avoid_log_tick = 0
 
+        # BOUNDARY log throttle — print at most once per 2 s
+        self._boundary_log_time = 0.0
+
         # Crash recovery (Phase 4)
         self._restart_count = 0
         self._was_in_offboard = False   # set True once we've entered offboard; gates crash detection
+        self._was_flipped = False       # set True while flipping; triggers re-arm check when it clears
 
         # RRT* path planner (Phase 2)
         self._rrt = RRTStarPlanner(
@@ -439,7 +443,7 @@ class QualifierMission:
         order = sorted(range(len(waypoints)), key=lambda i: dists[i])
         for idx in order:
             wp = waypoints[idx]
-            if not self._is_near_wall(wp[0], wp[1], extra=0.1):
+            if not self._is_near_wall(wp[0], wp[1], extra=0.5):
                 nearest = idx
                 break
         else:
@@ -759,7 +763,7 @@ class QualifierMission:
         cur_yaw = pose["yaw_deg"]
 
         # Emergency: near wall/forbidden — push toward zone 1 centre at VEL_MIN
-        if self._is_near_wall(cur_n, cur_e, extra=0.5):
+        if self._is_near_wall(cur_n, cur_e, extra=0.0):
             safe_n = self._origin_n + (ZONE1_N[0] + ZONE1_N[1]) / 2.0
             safe_e = self._origin_e + (ZONE1_E[0] + ZONE1_E[1]) / 2.0
             dn = safe_n - cur_n
@@ -770,7 +774,10 @@ class QualifierMission:
                 de /= mag
             yaw = math.degrees(math.atan2(de, dn))
             vd = max(-ALT_VEL_MAX, min(ALT_VEL_MAX, ALT_KP * (target_d - pose["down"])))
-            print(f"[BOUNDARY] Near wall/forbidden at N={cur_n:.1f} E={cur_e:.1f} — recovering")
+            _now = time.monotonic()
+            if _now - self._boundary_log_time >= 2.0:
+                print(f"[BOUNDARY] Near wall/forbidden at N={cur_n:.1f} E={cur_e:.1f} — recovering")
+                self._boundary_log_time = _now
             return VEL_MIN * dn, VEL_MIN * de, vd, yaw
 
         # Goal vector toward current waypoint
@@ -1107,18 +1114,35 @@ class QualifierMission:
                 await self._attempt_restart()
                 continue
 
-            # Flip detection: hold position so attitude can settle
+            # Flip detection: wait for attitude to settle; on clearance check if drone crashed
             if self.state.is_flipped:
                 roll  = self.state.latest_roll  or 0.0
                 pitch = self.state.latest_pitch or 0.0
-                print(f"[RECOVERY] Flip detected (roll={roll:.1f}° pitch={pitch:.1f}°) — holding position")
-                p = self._pose()
-                if p is not None:
-                    await self.drone.recovery_hover(
-                        p["north"], p["east"], p["down"], p["yaw_deg"]
-                    )
+                if not self._was_flipped:
+                    print(f"[RECOVERY] Flip detected (roll={roll:.1f}° pitch={pitch:.1f}°) — waiting for settle")
+                self._was_flipped = True
+                # Don't send position setpoints to a potentially crashed drone — just wait
+                await asyncio.sleep(0.5)
                 self._reset_stuck()
                 continue
+
+            # Flip just cleared — check if drone is grounded (crashed) rather than recovered in air
+            if self._was_flipped:
+                self._was_flipped = False
+                if not self.state.is_armed or not self.state.is_in_offboard:
+                    print(
+                        f"[RECOVERY] Drone upright but grounded "
+                        f"(armed={self.state.is_armed} offboard={self.state.is_in_offboard}) "
+                        f"— initiating re-arm"
+                    )
+                    if self._restart_count < MAX_RESTARTS:
+                        await self._attempt_restart()
+                    else:
+                        print("[RECOVERY] Max restarts reached — ending mission")
+                        self._state = MissionState.DONE
+                    continue
+                else:
+                    print("[RECOVERY] Flip recovered in air — resuming mission")
 
             handler = _dispatch.get(self._state)
             if handler is not None:
