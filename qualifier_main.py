@@ -133,6 +133,7 @@ class MissionState(Enum):
     CONNECT = "CONNECT"
     TAKEOFF = "TAKEOFF"
     STABILIZE = "STABILIZE"
+    CENTERING = "CENTERING"
     STARTUP_SCAN = "STARTUP_SCAN"
     EXPLORE = "EXPLORE"
     SCAN = "SCAN"
@@ -225,6 +226,9 @@ class QualifierMission:
 
         # OFFBOARD gate warn throttle
         self._offboard_warn_time = 0.0
+        # OFFBOARD persistence watchdog (Phase B)
+        self._offboard_lost_since = 0.0     # monotonic timestamp when loss began (0 = healthy)
+        self._offboard_recovery_count = 0   # auto re-entry attempts; aborts after 3
 
         # Crash recovery (Phase 4)
         self._restart_count = 0
@@ -949,30 +953,95 @@ class QualifierMission:
     # STABILIZE: block until pose + yaw + depth are all valid
     # ------------------------------------------------------------------
     async def _wait_stabilize(self):
+        """
+        Block until pose, yaw, depth are all valid AND pass sanity checks:
+        - Position: drone is airborne (down < -0.3 m, NED)
+        - Depth: at least 10% of pixels are finite-positive (not all NaN/Inf/0)
+        Stale (0,0,0) telemetry or all-NaN depth would otherwise sneak through.
+        """
         print(
-            f"[STABILIZE] Waiting for pose, yaw, and depth frame "
+            f"[STABILIZE] Waiting for pose+yaw+depth + sanity checks "
             f"(timeout={STABILIZE_TIMEOUT:.0f}s)..."
         )
         t0 = time.monotonic()
         while True:
             pose_ok  = self.state.latest_position is not None
             yaw_ok   = self.state.latest_yaw is not None
-            depth_ok = self.depth_rx.get_frame() is not None
+            depth = self.depth_rx.get_frame()
 
-            if pose_ok and yaw_ok and depth_ok:
-                print("[STABILIZE] All sensors valid — proceeding.")
+            # Pose sanity: drone must be airborne (NED: down < -0.3 m means above ground)
+            pose_airborne = pose_ok and self.state.latest_position.down_m < -0.3
+
+            # Depth sanity: enough finite positive pixels to be useful
+            depth_finite_frac = 0.0
+            depth_valid = False
+            if depth is not None:
+                d = np.asarray(depth, dtype=float)
+                depth_finite_frac = float(np.mean(np.isfinite(d) & (d > 0)))
+                depth_valid = depth_finite_frac > 0.1
+
+            if pose_airborne and yaw_ok and depth_valid:
+                p = self.state.latest_position
+                print(
+                    f"[STABILIZE] OK — pos N={p.north_m:.2f} E={p.east_m:.2f} D={p.down_m:.2f}  "
+                    f"yaw={self.state.latest_yaw:.1f}°  "
+                    f"depth_finite={depth_finite_frac*100:.0f}%"
+                )
                 return True
 
             elapsed = time.monotonic() - t0
             if elapsed > STABILIZE_TIMEOUT:
                 print(
                     f"[STABILIZE] Timeout after {STABILIZE_TIMEOUT:.0f}s — "
-                    f"pose={'ok' if pose_ok else 'MISSING'}  "
+                    f"pose={'ok' if pose_ok else 'MISSING'}({'airborne' if pose_airborne else 'GROUNDED'})  "
                     f"yaw={'ok' if yaw_ok else 'MISSING'}  "
-                    f"depth={'ok' if depth_ok else 'MISSING'}"
+                    f"depth={'ok' if depth_valid else f'BAD({depth_finite_frac*100:.0f}% finite)'}"
                 )
                 return False
 
+            await asyncio.sleep(0.2)
+
+    # ------------------------------------------------------------------
+    # SAFE CENTERING: move to Zone 1 geometric center before sweep
+    # Avoids spawn-corner trap when spawn is near a wall.
+    # ------------------------------------------------------------------
+    async def _safe_centering(self, timeout=10.0):
+        safe_n = self._origin_n + (ZONE1_N[0] + ZONE1_N[1]) / 2.0
+        safe_e = self._origin_e + (ZONE1_E[0] + ZONE1_E[1]) / 2.0
+        safe_d = -ALT_YELLOW
+        print(f"[CENTER] Moving to Zone 1 center N={safe_n:.1f} E={safe_e:.1f} alt={-safe_d:.1f}m")
+
+        p = self._pose()
+        if p is None:
+            print("[CENTER] No pose — skipping")
+            return
+        target_yaw = p["yaw_deg"]
+
+        deadline = time.monotonic() + timeout
+        arrived = False
+        while time.monotonic() < deadline:
+            p = self._pose()
+            if p is None:
+                await asyncio.sleep(0.1)
+                continue
+            horiz = math.hypot(p["north"] - safe_n, p["east"] - safe_e)
+            vert  = abs(p["down"] - safe_d)
+            if horiz < 0.6 and vert < 0.4:
+                arrived = True
+                print(f"[CENTER] Arrived (horiz={horiz:.2f}m, vert={vert:.2f}m)")
+                break
+            await self.drone.send_position_setpoint(safe_n, safe_e, safe_d, target_yaw)
+            await asyncio.sleep(0.1)
+
+        if not arrived:
+            p = self._pose()
+            if p is not None:
+                horiz = math.hypot(p["north"] - safe_n, p["east"] - safe_e)
+                print(f"[CENTER] Timeout (horiz={horiz:.2f}m) — proceeding anyway")
+
+        # Hold position briefly for stability before scan
+        for _ in range(10):
+            await self.drone.send_position_setpoint(safe_n, safe_e, safe_d, target_yaw)
             await asyncio.sleep(0.1)
 
     # ------------------------------------------------------------------
@@ -1201,22 +1270,54 @@ class QualifierMission:
                 else:
                     print("[RECOVERY] Flip recovered in air — resuming mission")
 
-            # OFFBOARD gate: if PX4 is not in OFFBOARD during active navigation,
-            # our velocity/position commands are silently ignored. Pause navigation
-            # and wait — a re-arm or operator action will restore the mode.
+            # OFFBOARD persistence watchdog (Phase B):
+            # If PX4 drops OFFBOARD mid-mission while armed and airborne, attempt
+            # automatic re-entry (no full re-arm). Up to 3 attempts.
+            # If grounded/disarmed, fall through to crash detection above.
             if (not self.state.is_in_offboard
                     and self._state in (MissionState.EXPLORE, MissionState.ESCAPE)):
                 _now = time.monotonic()
+                if self._offboard_lost_since == 0.0:
+                    self._offboard_lost_since = _now
+                lost_dur = _now - self._offboard_lost_since
+
+                p = self._pose()
+                airborne = p is not None and p["down"] < -0.3
+
+                # Sustained loss + still airborne + armed → try re-entry
+                if (lost_dur > 2.0
+                        and airborne
+                        and self.state.is_armed
+                        and self._offboard_recovery_count < 3):
+                    self._offboard_recovery_count += 1
+                    print(
+                        f"[OFFBOARD-WD] Lost {lost_dur:.1f}s while airborne "
+                        f"(alt={-p['down']:.2f}m) — re-entry attempt "
+                        f"{self._offboard_recovery_count}/3"
+                    )
+                    try:
+                        await self.drone._stream_zero_setpoints(count=10, interval=0.1)
+                        await self.drone._start_offboard_with_confirm(confirm_timeout=3.0)
+                        print("[OFFBOARD-WD] Re-entered ✓")
+                        self._offboard_lost_since = 0.0
+                    except Exception as e:
+                        print(f"[OFFBOARD-WD] Re-entry failed: {e}")
+                    continue
+
                 if _now - self._offboard_warn_time > 5.0:
-                    p = self._pose()
                     alt = -p["down"] if p else 0.0
                     print(
                         f"[WARN] Not in OFFBOARD (armed={self.state.is_armed} "
-                        f"alt={alt:.2f}m) — pausing navigation"
+                        f"alt={alt:.2f}m lost={lost_dur:.1f}s) — pausing navigation"
                     )
                     self._offboard_warn_time = _now
                 await asyncio.sleep(max(0.0, dt - (time.monotonic() - t0)))
                 continue
+            else:
+                # Healthy OFFBOARD — reset watchdog state
+                if self._offboard_lost_since != 0.0:
+                    self._offboard_lost_since = 0.0
+                    self._offboard_recovery_count = 0
 
             handler = _dispatch.get(self._state)
             if handler is not None:
@@ -1361,6 +1462,10 @@ class QualifierMission:
             await self._teardown_monitor(monitor)
             await self.drone.land()
             return
+
+        self._state = MissionState.CENTERING
+        print(f"[FSM] {self._state.value}")
+        await self._safe_centering()
 
         self._state = MissionState.STARTUP_SCAN
         print(f"[FSM] {self._state.value}")
