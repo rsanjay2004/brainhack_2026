@@ -103,6 +103,10 @@ STUCK_ESCAPE_M = 2.5
 # Detection confirmation
 DETECT_CONFIRM = 4
 
+# Carrot-point lookahead — drone targets a point this far ahead along the path,
+# not the raw WP. Shorter bursts = more responsive to local obstacles.
+LOOKAHEAD_DIST = 2.5   # m
+
 MERGE_DIST = 3.0
 
 # Map update throttle: update every N explore ticks (depth_to_xy_map subsamples 4x so cost is low)
@@ -242,6 +246,7 @@ class QualifierMission:
         self._was_in_offboard = False   # set True once we've entered offboard; gates crash detection
         self._was_flipped = False       # set True while flipping; triggers re-arm check when it clears
         self._flip_count = 0            # consecutive flips at current WP; resets on WP advance
+        self._flip_start_time = 0.0     # monotonic when flip first detected; used for 5s timeout
 
         # RRT* path planner (Phase 2)
         self._rrt = RRTStarPlanner(
@@ -458,6 +463,18 @@ class QualifierMission:
         near_e = e > self._e_max - WALL_MARGIN
         return (near_s or near_n) and (near_w or near_e)
 
+    def _carrot_point(self, pose, wp):
+        """Return a carrot point at most LOOKAHEAD_DIST ahead along pose→wp.
+        Keeps the drone moving in short bursts rather than lunging at distant WPs,
+        which improves local obstacle reactivity and gives smoother motion."""
+        dn = wp[0] - pose["north"]
+        de = wp[1] - pose["east"]
+        dist = math.hypot(dn, de)
+        if dist <= LOOKAHEAD_DIST or dist < 1e-3:
+            return wp[0], wp[1], wp[2]
+        t = LOOKAHEAD_DIST / dist
+        return (pose["north"] + t * dn, pose["east"] + t * de, wp[2])
+
     def _rotate_waypoints_to_most_open(self, waypoints):
         """
         Pick starting WP whose approach path (from current position) has
@@ -480,34 +497,42 @@ class QualifierMission:
         best_idx = None
         best_score = -1.0
 
-        for idx in order:
-            wp = waypoints[idx]
-            if self._is_near_wall(wp[0], wp[1], extra=0.5):
-                continue
+        # Two-pass: first try WPs within 12 m (prefer nearby clear paths); if
+        # none qualify (e.g. spawned far from all WPs) fall back to all WPs.
+        for dist_cap in (12.0, float("inf")):
+            for idx in order:
+                wp = waypoints[idx]
+                if self._is_near_wall(wp[0], wp[1], extra=0.5):
+                    continue
 
-            path_n = wp[0] - cur_n
-            path_e = wp[1] - cur_e
-            path_len = math.hypot(path_n, path_e) + 1e-6
+                path_n = wp[0] - cur_n
+                path_e = wp[1] - cur_e
+                path_len = math.hypot(path_n, path_e) + 1e-6
 
-            if obs_pts.shape[0] > 0:
-                t = np.clip(
-                    ((obs_pts[:, 0] - cur_n) * path_n + (obs_pts[:, 1] - cur_e) * path_e)
-                    / (path_len ** 2),
-                    0.0, 1.0,
-                )
-                closest_n = cur_n + t * path_n
-                closest_e = cur_e + t * path_e
-                dists_to_path = np.hypot(obs_pts[:, 0] - closest_n, obs_pts[:, 1] - closest_e)
-                obs_count = int(np.sum(dists_to_path < 1.5))
-            else:
-                obs_count = 0
+                if path_len > dist_cap:
+                    continue
 
-            # Higher score = more open + closer (prefer reachable nearby WPs over
-            # distant open zones; 0.05*path_len penalty keeps zone 3 from always winning)
-            score = 1.0 / (1.0 + obs_count + 0.05 * path_len)
-            if score > best_score:
-                best_score = score
-                best_idx = idx
+                if obs_pts.shape[0] > 0:
+                    t = np.clip(
+                        ((obs_pts[:, 0] - cur_n) * path_n + (obs_pts[:, 1] - cur_e) * path_e)
+                        / (path_len ** 2),
+                        0.0, 1.0,
+                    )
+                    closest_n = cur_n + t * path_n
+                    closest_e = cur_e + t * path_e
+                    dists_to_path = np.hypot(obs_pts[:, 0] - closest_n, obs_pts[:, 1] - closest_e)
+                    obs_count = int(np.sum(dists_to_path < 1.5))
+                else:
+                    obs_count = 0
+
+                # Higher score = more open + closer
+                score = 1.0 / (1.0 + obs_count + 0.05 * path_len)
+                if score > best_score:
+                    best_score = score
+                    best_idx = idx
+
+            if best_idx is not None:
+                break  # found a good nearby WP — skip the uncapped pass
 
         if best_idx is None:
             # All WPs near wall — fall back to nearest non-wall or first
@@ -1218,7 +1243,7 @@ class QualifierMission:
             self._state = MissionState.ESCAPE
             return
 
-        target_n, target_e, target_d = wp
+        target_n, target_e, target_d = wp   # real WP (used for arrival + forbidden check)
 
         # Skip WP whose destination is inside the forbidden zone.
         if self._wp_crosses_forbidden(cur_n, cur_e, target_n, target_e):
@@ -1241,8 +1266,13 @@ class QualifierMission:
         # Detection every tick — no stop-and-scan required (Phase 3)
         self._run_detection()
 
+        # Carrot point: target a point LOOKAHEAD_DIST ahead along path to WP.
+        # Prevents lunging at distant WPs; makes movement smoother and more
+        # reactive to local obstacles.
+        carrot_n, carrot_e, carrot_d = self._carrot_point(pose, wp)
+
         vn, ve, vd, yaw_deg = self._compute_velocity_setpoint(
-            pose, target_n, target_e, target_d, depth
+            pose, carrot_n, carrot_e, carrot_d, depth
         )
 
         await self.drone.send_velocity(vn, ve, vd, yaw_deg)
@@ -1468,8 +1498,20 @@ class QualifierMission:
                 roll  = self.state.latest_roll  or 0.0
                 pitch = self.state.latest_pitch or 0.0
                 if not self._was_flipped:
+                    self._flip_start_time = time.monotonic()
                     print(f"[RECOVERY] Flip detected (roll={roll:.1f}° pitch={pitch:.1f}°) — waiting for settle")
                 self._was_flipped = True
+                # Hard recovery if still flipped after 5 s — drone cannot right itself
+                if time.monotonic() - self._flip_start_time > 5.0:
+                    print("[RECOVERY] Flip timeout (>5s upside-down) — forcing hard recovery")
+                    self._was_flipped = False
+                    self._flip_count += 1
+                    if self._restart_count < MAX_RESTARTS:
+                        await self._attempt_restart()
+                    else:
+                        print("[RECOVERY] Max restarts reached — ending mission")
+                        self._state = MissionState.DONE
+                    continue
                 # Don't send position setpoints to a potentially crashed drone — just wait
                 await asyncio.sleep(0.5)
                 continue
@@ -1506,14 +1548,17 @@ class QualifierMission:
                         self._state = MissionState.DONE
                     continue
                 else:
-                    # Soft recovery: hold position 3 s to let drone stabilise
-                    # before resuming velocity commands, preventing immediate re-collision
+                    # Soft recovery: hold position 3 s to let drone stabilise.
+                    # Use WP target altitude — p["down"] may be wrong after
+                    # a flip-induced EKF home reference jump (seen as -459m / 15m boomerang).
+                    wp_now = self._current_wp()
+                    hold_d = wp_now[2] if wp_now else -ALT_YELLOW
                     print(
                         f"[RECOVERY] Soft recovery flip #{self._flip_count} "
-                        f"(alt={alt_m:.1f}m) — holding 3s then resuming"
+                        f"(alt={alt_m:.1f}m hold_d={hold_d:.2f}) — holding 3s then resuming"
                     )
                     await self.drone.send_position_setpoint(
-                        p["north"], p["east"], p["down"], p["yaw_deg"]
+                        p["north"], p["east"], hold_d, p["yaw_deg"]
                     )
                     await asyncio.sleep(3.0)
 

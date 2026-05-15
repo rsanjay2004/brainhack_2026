@@ -398,7 +398,7 @@ class Drone:
             )
             await asyncio.sleep(0.1)
 
-    async def rearm_and_takeoff(self, armable_timeout=30.0, target_alt=1.8):
+    async def rearm_and_takeoff(self, armable_timeout=45.0, target_alt=1.8):
         """
         Re-arm and take off via pure OFFBOARD after a crash.
         Same flow as arm_and_takeoff but with shorter armable timeout.
