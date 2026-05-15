@@ -1,6 +1,17 @@
 import numpy as np
-from scipy.spatial import KDTree
-import matplotlib.pyplot as plt
+
+
+class _NNIndex:
+    """Numpy brute-force nearest-neighbor index — drop-in for scipy KDTree (k=1 queries only)."""
+    def __init__(self, points):
+        self._pts = np.asarray(points, dtype=np.float32)
+
+    def query(self, point, k=1):
+        diffs = self._pts - np.asarray(point, dtype=np.float32)
+        dists = np.sqrt((diffs * diffs).sum(axis=1))
+        idx = int(np.argmin(dists))
+        return float(dists[idx]), idx
+
 
 class RRTStarPlanner:
     """
@@ -30,7 +41,7 @@ class RRTStarPlanner:
         costs = [0.0]
         parents = [-1]
         
-        kdtree = KDTree(obstacle_points) if len(obstacle_points) > 0 else None
+        kdtree = _NNIndex(obstacle_points) if len(obstacle_points) > 0 else None
 
         for _ in range(self.max_iter):
             # 1. Sample

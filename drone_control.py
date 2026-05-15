@@ -40,8 +40,13 @@ class Drone:
         Polls at 2 Hz to avoid flooding the MAVLink channel with ACK losses.
         """
         deadline = asyncio.get_event_loop().time() + timeout
+        start_t = asyncio.get_event_loop().time()
         consecutive = 0
+        last_print = start_t - 4.0  # force immediate first print
         while asyncio.get_event_loop().time() < deadline:
+            now = asyncio.get_event_loop().time()
+            elapsed = now - start_t
+            remaining = timeout - elapsed
             try:
                 async for health in self.drone.telemetry.health():
                     if health.is_armable:
@@ -52,8 +57,16 @@ class Drone:
             except Exception:
                 consecutive = 0
             if consecutive >= stable_samples:
+                print(f"\r[EKF] Ready! ({elapsed:.1f}s)                              ")
                 return True
+            if now - last_print >= 2.0:
+                bar_len = 20
+                filled = int(bar_len * consecutive / stable_samples)
+                bar = "#" * filled + "-" * (bar_len - filled)
+                print(f"\r[EKF] Waiting [{bar}] {consecutive}/{stable_samples} | {elapsed:.0f}s elapsed | {remaining:.0f}s left", end="", flush=True)
+                last_print = now
             await asyncio.sleep(0.5)   # 2 Hz — prevents MAVLink ACK flooding
+        print()  # newline after progress bar
         return False
 
     async def _is_armed_once(self):
