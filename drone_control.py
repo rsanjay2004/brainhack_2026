@@ -175,6 +175,10 @@ class Drone:
             stream_task = asyncio.create_task(_background_stream())
 
             try:
+                if await self._in_offboard_now():
+                    print("[DRONE] OFFBOARD already active ✓")
+                    return
+
                 last_exc = None
                 for attempt in range(3):
                     try:
@@ -241,7 +245,7 @@ class Drone:
     async def arm_and_takeoff(self, target_alt=1.8, ascent_timeout=60.0):
         # Step 1: pre-arm
         print("[DRONE] Waiting for EKF / pre-arm checks...")
-        ready = await self._wait_armable(timeout=90.0, stable_samples=8)
+        ready = await self._wait_armable(timeout=90.0, stable_samples=4)
         if not ready:
             raise RuntimeError(
                 "[DRONE] Timed out waiting for stable armable state. "
@@ -281,8 +285,10 @@ class Drone:
             if alt >= target_alt - 0.2:
                 break
             try:
+                # Overshoot by 2m so PX4 position controller applies full thrust
+                # from ground. Without overshoot PX4 decelerates early → slow ascent.
                 await self.drone.offboard.set_position_ned(
-                    PositionNedYaw(north_m=lock_n, east_m=lock_e, down_m=-target_alt, yaw_deg=lock_yaw)
+                    PositionNedYaw(north_m=lock_n, east_m=lock_e, down_m=-(target_alt + 2.0), yaw_deg=lock_yaw)
                 )
             except Exception as e:
                 if _is_grpc_lost(e):
@@ -296,9 +302,11 @@ class Drone:
                     raise
             await asyncio.sleep(0.1)
 
-        # Step 6: hover hold (1s of zero-velocity to settle)
+        # Step 6: hold exact target altitude via position setpoint to settle
         for _ in range(10):
-            await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, 0.0))
+            await self.drone.offboard.set_position_ned(
+                PositionNedYaw(north_m=lock_n, east_m=lock_e, down_m=-target_alt, yaw_deg=lock_yaw)
+            )
             await asyncio.sleep(0.1)
 
         final_alt = await self._read_alt()
@@ -410,12 +418,14 @@ class Drone:
             if alt >= target_alt - 0.2:
                 break
             await self.drone.offboard.set_position_ned(
-                PositionNedYaw(north_m=lock_n, east_m=lock_e, down_m=-target_alt, yaw_deg=lock_yaw)
+                PositionNedYaw(north_m=lock_n, east_m=lock_e, down_m=-(target_alt + 2.0), yaw_deg=lock_yaw)
             )
             await asyncio.sleep(0.1)
 
         for _ in range(10):
-            await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, 0.0))
+            await self.drone.offboard.set_position_ned(
+                PositionNedYaw(north_m=lock_n, east_m=lock_e, down_m=-target_alt, yaw_deg=lock_yaw)
+            )
             await asyncio.sleep(0.1)
 
         final_alt = await self._read_alt()

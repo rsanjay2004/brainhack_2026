@@ -22,31 +22,59 @@ async def position_monitor_task(drone: Drone, state: SharedState, stop_event: as
     print("Position monitor task started...")
 
     async def stream_position():
-        async for pos_vel in drone.drone.telemetry.position_velocity_ned():
-            if stop_event.is_set():
-                break
-            state.latest_position = pos_vel.position
+        while not stop_event.is_set():
+            try:
+                async for pos_vel in drone.drone.telemetry.position_velocity_ned():
+                    if stop_event.is_set():
+                        return
+                    state.latest_position = pos_vel.position
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if not stop_event.is_set():
+                    await asyncio.sleep(1.0)
 
     async def stream_yaw():
-        async for att in drone.drone.telemetry.attitude_euler():
-            if stop_event.is_set():
-                break
-            state.latest_yaw   = att.yaw_deg
-            state.latest_roll  = att.roll_deg
-            state.latest_pitch = att.pitch_deg
-            state.is_flipped   = (abs(att.roll_deg) > 70.0 or abs(att.pitch_deg) > 70.0)
+        while not stop_event.is_set():
+            try:
+                async for att in drone.drone.telemetry.attitude_euler():
+                    if stop_event.is_set():
+                        return
+                    state.latest_yaw   = att.yaw_deg
+                    state.latest_roll  = att.roll_deg
+                    state.latest_pitch = att.pitch_deg
+                    state.is_flipped   = (abs(att.roll_deg) > 70.0 or abs(att.pitch_deg) > 70.0)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if not stop_event.is_set():
+                    await asyncio.sleep(1.0)
 
     async def stream_armed():
-        async for armed in drone.drone.telemetry.armed():
-            if stop_event.is_set():
-                break
-            state.is_armed = armed
+        while not stop_event.is_set():
+            try:
+                async for armed in drone.drone.telemetry.armed():
+                    if stop_event.is_set():
+                        return
+                    state.is_armed = armed
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if not stop_event.is_set():
+                    await asyncio.sleep(1.0)
 
     async def stream_flight_mode():
-        async for mode in drone.drone.telemetry.flight_mode():
-            if stop_event.is_set():
-                break
-            state.is_in_offboard = ("OFFBOARD" in str(mode).upper())
+        while not stop_event.is_set():
+            try:
+                async for mode in drone.drone.telemetry.flight_mode():
+                    if stop_event.is_set():
+                        return
+                    state.is_in_offboard = ("OFFBOARD" in str(mode).upper())
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if not stop_event.is_set():
+                    await asyncio.sleep(1.0)
 
     try:
         await asyncio.gather(
@@ -57,7 +85,7 @@ async def position_monitor_task(drone: Drone, state: SharedState, stop_event: as
         )
 
     except asyncio.CancelledError:
-        print("📡 Position monitor task cancelled.")
+        print("Position monitor task cancelled.")
     except Exception as e:
         print(f"Monitor error: {type(e).__name__}: {e}")
 
