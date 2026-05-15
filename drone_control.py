@@ -236,9 +236,14 @@ class Drone:
     # ------------------------------------------------------------------
 
     async def _read_alt(self):
-        """Returns altitude in meters above ground (NED: alt = -down)."""
+        """Returns altitude in meters above ground (NED: alt = -down).
+        After re-arm the EKF home reference resets; SharedState may hold stale
+        down_m that is wildly wrong (e.g. -459 m). Sanity-gate: only trust
+        SharedState if the value is within the plausible indoor-arena range."""
         if self.state is not None and self.state.latest_position is not None:
-            return -float(self.state.latest_position.down_m)
+            alt = -float(self.state.latest_position.down_m)
+            if -2.0 <= alt <= 20.0:
+                return alt
         _, _, d = await self.get_position()
         return -float(d)
 
@@ -400,6 +405,10 @@ class Drone:
         """
         # Crash severs the gRPC channel — reconnect before anything else.
         print("[DRONE] Reconnecting after crash...")
+        # Invalidate stale SharedState position so _read_alt falls back to a
+        # direct poll and callers wait for genuinely fresh telemetry.
+        if self.state:
+            self.state.latest_position = None
         await self.connect()
         await asyncio.sleep(2.0)
 

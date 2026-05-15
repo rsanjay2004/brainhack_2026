@@ -245,9 +245,9 @@ class BarrelDetector:
             if w <= 0 or h <= 0:
                 continue
             aspect = h / max(w, 1)
-            # Target canisters are tall/narrow (aspect >= 1.6).
+            # Target canisters are tall/narrow (aspect >= 2.0).
             # Decoy barrels are roughly round (aspect ~1.0) — filtered out here.
-            if 1.6 <= aspect <= 3.5:
+            if 2.0 <= aspect <= 3.5:
                 return True
         return False
     

@@ -502,8 +502,9 @@ class QualifierMission:
             else:
                 obs_count = 0
 
-            # Higher score = more open + farther (prefer reaching deep into open space)
-            score = path_len / (1.0 + obs_count)
+            # Higher score = more open + closer (prefer reachable nearby WPs over
+            # distant open zones; 0.05*path_len penalty keeps zone 3 from always winning)
+            score = 1.0 / (1.0 + obs_count + 0.05 * path_len)
             if score > best_score:
                 best_score = score
                 best_idx = idx
