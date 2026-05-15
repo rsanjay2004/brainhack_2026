@@ -50,8 +50,9 @@ ARENA_WALL_SEGS_REL = [
 ]
 
 WALL_MARGIN  = 2.5   # stay this far from walls at all times
-W_WALL       = 0.5   # continuous geometric wall repulsion weight
-WALL_INF_M   = 3.5   # wall influence radius (m) > WALL_MARGIN so repulsion starts before margin
+W_WALL       = 1.0   # continuous geometric wall repulsion weight (Stage 2: 0.5→1.0)
+WALL_INF_M   = 5.0   # wall influence radius (Stage 2: 3.5→5.0 — starts repulsion earlier)
+WP_WALL_BUFFER = 1.0 # extra buffer beyond WALL_MARGIN when generating sweep WPs (Fix F)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # RRT* path planning — runs once per waypoint leg in a background thread
@@ -751,11 +752,15 @@ class QualifierMission:
             (ZONE3_N, ZONE3_E),
         ]
         wps = []
+        # WPs sit at WALL_MARGIN + WP_WALL_BUFFER from walls — extra buffer keeps
+        # the drone from skimming wall margins (the prior margin-flush layout put
+        # WPs literally at the boundary, leading to wall-hug behaviour).
+        buf = WALL_MARGIN + WP_WALL_BUFFER
         for (n_lo, n_hi), (e_lo, e_hi) in zones:
-            n0 = self._origin_n + n_lo + WALL_MARGIN
-            n1 = self._origin_n + n_hi - WALL_MARGIN
-            e0 = self._origin_e + e_lo + WALL_MARGIN
-            e1 = self._origin_e + e_hi - WALL_MARGIN
+            n0 = self._origin_n + n_lo + buf
+            n1 = self._origin_n + n_hi - buf
+            e0 = self._origin_e + e_lo + buf
+            e1 = self._origin_e + e_hi - buf
             if n1 <= n0 or e1 <= e0:
                 continue
 
@@ -1117,11 +1122,25 @@ class QualifierMission:
                     print(f"[AVOID] L={cl['left']:.1f} C={cl['center']:.1f} "
                           f"R={cl['right']:.1f}")
 
-        # Emergency stop: obstacle < 0.6 m ahead OR < 0.5 m to either side.
-        # Side threshold catches corner clips where center clearance looks fine.
+        # Emergency: obstacle < 0.6 m ahead OR < 0.5 m to either side.
+        # Pure hover (vn=ve=0) lets the drone sit next to the obstacle until
+        # stuck-timeout fires (~10 s wasted). Instead back away at VEL_MIN
+        # opposite the closest-obstacle direction so the drone unsticks itself.
         if center_clearance < 0.6 or min(left_clearance, right_clearance) < 0.5:
+            yaw_rad = math.radians(cur_yaw)
+            # NED clockwise convention: forward=(cos,sin), left=yaw-90°, right=yaw+90°
+            fwd_n,  fwd_e  = math.cos(yaw_rad), math.sin(yaw_rad)
+            left_n, left_e = math.cos(yaw_rad - math.pi / 2), math.sin(yaw_rad - math.pi / 2)
+            right_n, right_e = math.cos(yaw_rad + math.pi / 2), math.sin(yaw_rad + math.pi / 2)
+            sectors = [
+                (center_clearance, fwd_n,  fwd_e),
+                (left_clearance,   left_n, left_e),
+                (right_clearance,  right_n, right_e),
+            ]
+            _, obs_n, obs_e = min(sectors, key=lambda s: s[0])
+            back_n, back_e = -obs_n, -obs_e
             vd = max(-ALT_VEL_MAX, min(ALT_VEL_MAX, ALT_KP * (target_d - pose["down"])))
-            return 0.0, 0.0, vd, cur_yaw
+            return VEL_MIN * back_n, VEL_MIN * back_e, vd, cur_yaw
 
         # Memory-map repulsion from GlobalMapper
         mem_n, mem_e = self.mapper.get_repulsion_vector(cur_n, cur_e, MAP_INFLUENCE_M)
@@ -1194,10 +1213,28 @@ class QualifierMission:
         # NED: down < 0 when above ground; positive vd moves toward ground
         vd = max(-ALT_VEL_MAX, min(ALT_VEL_MAX, ALT_KP * (target_d - pose["down"])))
 
-        # --- Yaw rate limit — prevents snapping to face a wall in one tick ---
+        # --- Yaw control: motion direction + bias toward closest side obstacle ---
+        # Pure motion-direction yaw means depth camera always looks at the goal,
+        # so side obstacles enter FOV only after the drone is already close.
+        # Biasing yaw toward the tighter side makes the depth camera track that
+        # obstacle, giving better local awareness for wall-hug scenarios.
         desired_yaw = math.degrees(math.atan2(blend_e, blend_n))
         if not math.isfinite(desired_yaw):
             desired_yaw = cur_yaw
+
+        side_tilt_max = 30.0
+        # Only tilt when one side is meaningfully tighter than center and SAFE_DIST
+        if (left_clearance < right_clearance
+                and left_clearance < center_clearance
+                and left_clearance < SAFE_DIST):
+            bias = side_tilt_max * (1.0 - left_clearance / SAFE_DIST)
+            desired_yaw -= bias   # yaw left in NED clockwise convention
+        elif (right_clearance < left_clearance
+                and right_clearance < center_clearance
+                and right_clearance < SAFE_DIST):
+            bias = side_tilt_max * (1.0 - right_clearance / SAFE_DIST)
+            desired_yaw += bias   # yaw right
+
         yaw_error = ((desired_yaw - cur_yaw + 180.0) % 360.0) - 180.0
         yaw_step  = max(-YAW_RATE_MAX, min(YAW_RATE_MAX, yaw_error))
         commanded_yaw = cur_yaw + yaw_step
