@@ -30,7 +30,7 @@ class FramePacket:
 
 # Yellow barrel — wider H range and lower S/V thresholds to handle
 # Gazebo's lighting which can desaturate colours compared to real life
-YELLOW_LOWER = np.array([15,  60,  60])
+YELLOW_LOWER = np.array([22,  60,  60])
 YELLOW_UPPER = np.array([45, 255, 255])
 
 # Red barrel — hue wraps at 0/180 in OpenCV so two ranges are needed
@@ -46,8 +46,8 @@ MIN_AREA_RED    = 200
 
 # Maximum contour area — rejects large decoy barrels (biohazard cylinders).
 # Target canisters are small; decoy barrels fill 5-10× more pixels at same distance.
-MAX_AREA_YELLOW = 4000
-MAX_AREA_RED    = 3000
+MAX_AREA_YELLOW = 1500
+MAX_AREA_RED    = 1500
 
 
 class BarrelDetector:
@@ -245,9 +245,9 @@ class BarrelDetector:
             if w <= 0 or h <= 0:
                 continue
             aspect = h / max(w, 1)
-            # Target canisters are tall/narrow (aspect >= 1.3).
+            # Target canisters are tall/narrow (aspect >= 1.6).
             # Decoy barrels are roughly round (aspect ~1.0) — filtered out here.
-            if 1.3 <= aspect <= 3.5:
+            if 1.6 <= aspect <= 3.5:
                 return True
         return False
     

@@ -101,7 +101,7 @@ STUCK_DIST_M = 0.4
 STUCK_ESCAPE_M = 2.5
 
 # Detection confirmation
-DETECT_CONFIRM = 2
+DETECT_CONFIRM = 4
 
 MERGE_DIST = 3.0
 
@@ -224,8 +224,6 @@ class QualifierMission:
         # BOUNDARY log throttle — print at most once per 2 s
         self._boundary_log_time = 0.0
 
-        # Boundary persistence WP skip — prevents infinite loop against forbidden zone
-        self._boundary_wp_stuck_ticks = 0
 
         # OFFBOARD gate warn throttle
         self._offboard_warn_time = 0.0
@@ -320,6 +318,16 @@ class QualifierMission:
             else:
                 e = self._origin_e + FORBIDDEN_E[1] + WALL_MARGIN
         return n, e
+
+    def _wp_crosses_forbidden(self, cur_n, cur_e, wp_n, wp_e, samples=10) -> bool:
+        """Return True if line from current pos to WP passes through forbidden zone."""
+        for i in range(samples + 1):
+            t = i / samples
+            sn = cur_n + t * (wp_n - cur_n)
+            se = cur_e + t * (wp_e - cur_e)
+            if self._in_forbidden(sn, se, margin=WALL_MARGIN):
+                return True
+        return False
 
     def _is_near_wall(self, n, e, extra=0.0):
         m = WALL_MARGIN + extra
@@ -1205,21 +1213,14 @@ class QualifierMission:
             self._state = MissionState.ESCAPE
             return
 
-        # Boundary persistence: if drone is wall-locked for >5s it means the
-        # current WP requires crossing the forbidden zone and boundary recovery
-        # alone can't resolve it. Skip the WP so the mission can progress.
-        if self._is_near_wall(cur_n, cur_e, extra=0.0):
-            self._boundary_wp_stuck_ticks += 1
-            if self._boundary_wp_stuck_ticks >= 100:  # 5s @ 20Hz
-                self._boundary_wp_stuck_ticks = 0
-                if self._wp_idx < len(self._waypoints) - 1:
-                    print(f"[BOUNDARY] Wall-locked 5s — skipping WP {self._wp_idx}")
-                    self._advance_wp()
-                return
-        else:
-            self._boundary_wp_stuck_ticks = 0
-
         target_n, target_e, target_d = wp
+
+        # Skip WP immediately if direct path crosses forbidden zone — no timer needed.
+        if self._wp_crosses_forbidden(cur_n, cur_e, target_n, target_e):
+            print(f"[BOUNDARY] WP {self._wp_idx} path crosses forbidden zone — skipping")
+            if self._wp_idx < len(self._waypoints) - 1:
+                self._advance_wp()
+            return
 
         # Sanitize depth before any planner/map use
         depth = self._sanitize_depth(self.depth_rx.get_frame())
@@ -1434,7 +1435,13 @@ class QualifierMission:
             # Flip just cleared — check if drone is grounded (crashed) rather than recovered in air
             if self._was_flipped:
                 self._was_flipped = False
-                if not self.state.is_armed or not self.state.is_in_offboard:
+                p = self._pose()
+                grounded = (
+                    not self.state.is_armed
+                    or not self.state.is_in_offboard
+                    or (p is not None and p["down"] > -0.3)
+                )
+                if grounded:
                     print(
                         f"[RECOVERY] Drone upright but grounded "
                         f"(armed={self.state.is_armed} offboard={self.state.is_in_offboard}) "
