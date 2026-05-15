@@ -230,6 +230,12 @@ class QualifierMission:
         self._offboard_lost_since = 0.0     # monotonic timestamp when loss began (0 = healthy)
         self._offboard_recovery_count = 0   # auto re-entry attempts; aborts after 3
 
+        # Tiered recovery (Phase C8) — escalate escape behaviour after consecutive stucks
+        self._consecutive_stuck = 0         # reset on successful WP arrival
+
+        # Detection-adjacent WP biasing (Phase C9) — track cells inserted as priority
+        self._biased_cells = set()
+
         # Crash recovery (Phase 4)
         self._restart_count = 0
         self._was_in_offboard = False   # set True once we've entered offboard; gates crash detection
@@ -580,6 +586,8 @@ class QualifierMission:
                         f"cell=({ci},{cj}) N={cell_n:.1f} E={cell_e:.1f}  "
                         f"{self.tracker.summary()}"
                     )
+                    # Phase C9: bias search toward neighbor cells (clusters)
+                    self._insert_neighbor_wps(ci, cj, ALT_YELLOW)
             self._yellow_streak = 0
 
         if self._red_streak >= DETECT_CONFIRM:
@@ -591,6 +599,8 @@ class QualifierMission:
                         f"cell=({ci},{cj}) N={cell_n:.1f} E={cell_e:.1f}  "
                         f"{self.tracker.summary()}"
                     )
+                    # Phase C9: bias search toward neighbor cells (clusters)
+                    self._insert_neighbor_wps(ci, cj, ALT_RED)
             self._red_streak = 0
 
     # ------------------------------------------------------------------
@@ -641,6 +651,8 @@ class QualifierMission:
     def _advance_wp(self):
         self._wp_idx += 1
         self._reset_stuck()
+        if self._consecutive_stuck > 0:
+            self._consecutive_stuck = 0   # arriving at any WP = made progress
         wp = self._current_wp()
         if wp:
             print(f"[NAV] WP {self._wp_idx}/{len(self._waypoints)}  "
@@ -788,6 +800,96 @@ class QualifierMission:
         self._rrt_for_wp = to_idx
         self._rrt_task = asyncio.create_task(asyncio.to_thread(_plan_sync))
 
+    async def _replan_via_rrt(self, target_wp):
+        """
+        On-demand RRT* replan from current pose to target_wp. Inserts the
+        intermediate path before the current wp_idx so navigation continues
+        through the replanned route. Returns True if path was inserted.
+        Used by Tier 2 escape escalation (Phase C8).
+        """
+        p = self._pose()
+        if p is None:
+            return False
+
+        obs_pts = self.mapper.get_global_points()
+        if obs_pts.shape[0] == 0:
+            obs_pts = np.array([[self._n_max + 100, self._e_max + 100]])
+
+        bounds = np.array([[self._n_min, self._n_max], [self._e_min, self._e_max]])
+
+        try:
+            path = await asyncio.to_thread(
+                self._rrt.plan,
+                [p["north"], p["east"]],
+                [target_wp[0], target_wp[1]],
+                obs_pts,
+                bounds,
+            )
+        except Exception as e:
+            print(f"[REPLAN] RRT* threw: {e}")
+            return False
+
+        if path is None or len(path) <= 2:
+            return False
+
+        alt_d = target_wp[2]
+        intermediate = [(float(pt[0]), float(pt[1]), alt_d) for pt in path[1:-1]]
+        if not intermediate:
+            return False
+        n_ins = len(intermediate)
+        self._waypoints = (
+            self._waypoints[:self._wp_idx]
+            + intermediate
+            + self._waypoints[self._wp_idx:]
+        )
+        # Shift pending RRT* target index so the background plan still maps to the same WP
+        if self._rrt_for_wp >= self._wp_idx:
+            self._rrt_for_wp += n_ins
+        print(f"[REPLAN] Inserted {n_ins} sub-WPs before WP {self._wp_idx}")
+        return True
+
+    def _insert_neighbor_wps(self, ci, cj, alt):
+        """
+        After detection at cell (ci, cj), insert the 4 cardinal neighbor cells
+        as priority WPs. Skips cells that are blocked, already visited, near a
+        wall, or already biased. Phase C9 — biases search around clusters.
+        """
+        if self._grid is None:
+            return
+        down = -alt
+        inserted = []
+        for di, dj in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+            ni, nj = ci + di, cj + dj
+            cell_key = (ni, nj)
+            if cell_key in self._biased_cells:
+                continue
+            if not self._valid_cell(ni, nj):
+                continue
+            cell = self._grid[ni][nj]
+            if cell.blocked or cell.visited_count > 0:
+                continue
+            cn, ce = self._cell_to_ned(ni, nj)
+            if self._is_near_wall(cn, ce, extra=0.0):
+                continue
+            self._biased_cells.add(cell_key)
+            inserted.append((cn, ce, down))
+
+        if inserted:
+            insert_at = self._wp_idx + 1
+            n_ins = len(inserted)
+            self._waypoints = (
+                self._waypoints[:insert_at]
+                + inserted
+                + self._waypoints[insert_at:]
+            )
+            # Shift pending RRT* target index to track the same target WP
+            if self._rrt_for_wp >= insert_at:
+                self._rrt_for_wp += n_ins
+            print(
+                f"[BIAS] Detection cluster at ({ci},{cj}) — "
+                f"inserted {n_ins} neighbor cells after WP {self._wp_idx}"
+            )
+
     def _try_apply_rrt_plan(self):
         """If a background plan is ready for wp_idx+1, insert its intermediate points."""
         if (self._rrt_task is None
@@ -804,6 +906,9 @@ class QualifierMission:
         if path is None or len(path) <= 2:
             return  # RRT* failed or path is trivial — use direct leg
 
+        # Defensive bounds check — _rrt_for_wp shifts are tracked but be safe
+        if self._rrt_for_wp >= len(self._waypoints) or self._rrt_for_wp < 0:
+            return
         target_wp = self._waypoints[self._rrt_for_wp]
         alt_d = target_wp[2]
         # path[0] = start (current WP, already visited), path[-1] = goal (already in list)
@@ -1158,23 +1263,69 @@ class QualifierMission:
     # State tick: ESCAPE
     # ------------------------------------------------------------------
     async def _tick_escape(self):
-        await self._escape_stuck()
+        """
+        Tiered recovery (Phase C8). Counter resets on WP arrival via _advance_wp.
+          Tier 1: reactive escape direction + skip 1 WP (original behaviour)
+          Tier 2: RRT* on-demand replan from current pose to current WP
+          Tier 3+: skip 3 WPs to bypass current sweep row
+        """
+        self._consecutive_stuck += 1
+        tier = self._consecutive_stuck
+        wp = self._current_wp()
+        print(f"[ESCAPE] Tier {tier} (consecutive stucks at this leg)")
 
-        # Hold position for 2s so depth/IMU settle before resuming navigation
-        p = self._pose()
-        if p is not None:
-            await self.drone.send_position_setpoint(
-                p["north"], p["east"], p["down"], p["yaw_deg"]
-            )
-        await asyncio.sleep(2.0)
+        if tier == 1:
+            # Reactive escape — random non-wall direction
+            await self._escape_stuck()
+            p = self._pose()
+            if p is not None:
+                await self.drone.send_position_setpoint(
+                    p["north"], p["east"], p["down"], p["yaw_deg"]
+                )
+            await asyncio.sleep(2.0)
+            if self._wp_idx < len(self._waypoints) - 1:
+                self._wp_idx += 1
+                nwp = self._current_wp()
+                if nwp:
+                    print(f"[ESCAPE] T1 — skipping stuck WP → WP {self._wp_idx}/"
+                          f"{len(self._waypoints)} N={nwp[0]:.1f} E={nwp[1]:.1f}")
 
-        # Skip the waypoint that caused stuck — don't return to the same corner
-        if self._wp_idx < len(self._waypoints) - 1:
-            self._wp_idx += 1
-            wp = self._current_wp()
-            if wp:
-                print(f"[ESCAPE] Skipping stuck WP → WP {self._wp_idx}/{len(self._waypoints)}  "
-                      f"N={wp[0]:.1f} E={wp[1]:.1f}")
+        elif tier == 2:
+            # On-demand RRT* replan to current target
+            print("[ESCAPE] T2 — invoking on-demand RRT* replan")
+            ok = False
+            if wp is not None:
+                ok = await self._replan_via_rrt(wp)
+            if not ok:
+                print("[ESCAPE] T2 — RRT* failed, fallback to skip + escape")
+                await self._escape_stuck()
+                if self._wp_idx < len(self._waypoints) - 1:
+                    self._wp_idx += 1
+            p = self._pose()
+            if p is not None:
+                await self.drone.send_position_setpoint(
+                    p["north"], p["east"], p["down"], p["yaw_deg"]
+                )
+            await asyncio.sleep(1.5)
+
+        else:
+            # Tier 3+: skip multiple WPs to bypass row entirely
+            old = self._wp_idx
+            self._wp_idx = min(self._wp_idx + 3, len(self._waypoints) - 1)
+            nwp = self._current_wp()
+            jumped = self._wp_idx - old
+            print(f"[ESCAPE] T3+ — skipping {jumped} WPs to bypass row")
+            if nwp:
+                print(f"  New target: WP {self._wp_idx}/{len(self._waypoints)} "
+                      f"N={nwp[0]:.1f} E={nwp[1]:.1f}")
+            self._reset_stuck()
+            self._consecutive_stuck = 0   # bypassed row — clear escalation
+            p = self._pose()
+            if p is not None:
+                await self.drone.send_position_setpoint(
+                    p["north"], p["east"], p["down"], p["yaw_deg"]
+                )
+            await asyncio.sleep(1.0)
 
         print("[FSM] ESCAPE → EXPLORE")
         self._state = MissionState.EXPLORE
