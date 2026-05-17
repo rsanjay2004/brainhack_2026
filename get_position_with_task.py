@@ -43,7 +43,7 @@ async def position_monitor_task(drone: Drone, state: SharedState, stop_event: as
                     state.latest_yaw   = att.yaw_deg
                     state.latest_roll  = att.roll_deg
                     state.latest_pitch = att.pitch_deg
-                    state.is_flipped   = (abs(att.roll_deg) > 70.0 or abs(att.pitch_deg) > 70.0)
+                    state.is_flipped   = (abs(att.roll_deg) > 100.0 or abs(att.pitch_deg) > 100.0)
             except asyncio.CancelledError:
                 raise
             except Exception:

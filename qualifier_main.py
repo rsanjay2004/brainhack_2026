@@ -1,10 +1,50 @@
 # qualifier_main.py
+#
+# ─────────────────────────────────────────────────────────────────────────────
+#  DRONE FUNCTIONALITY CHECKLIST  (DO NOT REMOVE ANY OF THESE BEHAVIOURS)
+# ─────────────────────────────────────────────────────────────────────────────
+#  Perception:
+#    • Depth-camera obstacle detection — AvoidancePlanner reports L/C/R clearance
+#    • Live 2D obstacle map (GlobalMapper) — accumulates obstacles over flight
+#    • YOLO/HSV barrel detector — every tick during EXPLORE (Phase 3)
+#    • 360° startup scan — seeds initial obstacle map
+#    • Phase-transition scan — re-scan environment at new altitude
+#
+#  Navigation:
+#    • Velocity-controlled flight (not position setpoints) with hard cap VEL_MAX
+#    • Carrot lookahead (LOOKAHEAD_DIST) — short bursts instead of distant pull
+#    • Geometric wall repulsion (continuous, FOV-independent)
+#    • Memory-map repulsion (GlobalMapper.get_repulsion_vector)
+#    • Path-history repulsion — drone avoids returning to recently visited cells
+#    • Origin repulsion — heavily penalizes returning to spawn
+#    • Yaw biases toward closest side obstacle (early lateral awareness)
+#    • Boustrophedon (lawnmower) sweep WPs per zone
+#    • RRT* path planning — startup validation + background per leg
+#    • Nearest-unvisited WP skip — never backtrack across arena on a skip
+#
+#  Safety / collision avoidance:
+#    • Three-tier clearance bands: SAFE_DIST → CRIT_DIST → emergency (<0.6m)
+#    • Emergency LATERAL SLIDE toward most-open sector (no retreating)
+#    • LOOK_AROUND state — 360° depth scan when AVOID persists (>2s) so drone
+#      sees beyond its 60° FOV before committing to a direction
+#    • Altitude bump — climbs 0.5m when stuck in AVOID-CRIT >10s
+#    • EKF altitude/XY-jump guards — abort hover on implausible pose
+#    • Forbidden-zone WP skipping
+#
+#  Recovery:
+#    • Tiered ESCAPE state — reactive direction, on-demand RRT*, row skip
+#    • Crash recovery: land → disarm → re-arm → takeoff → resume
+#    • OFFBOARD watchdog — auto re-enters OFFBOARD on drop
+#
+#  Logging:
+#    • Verbose decision-making logs with cardinal directions (N/NE/E/...)
+#    • Rate-limited [NAV], [AVOID], [LOOK], [ESCAPE], [FSM] traces
+# ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
 import math
 import sys
 import time
-from enum import Enum
 
 import numpy as np
 
@@ -16,135 +56,10 @@ from barrel_detector import BarrelDetector, DetectionTracker
 from GlobalMapper import GlobalMapper
 from RRTStarPlanner import RRTStarPlanner
 
-DEPTH_TOPIC = "/depth_camera"
-
-# ── Arena geometry ── swap this entire block when official map is released ───
-# All coordinates are spawn-relative NED (N=North offset, E=East offset), meters.
-# Drone spawns at approx N=4, E=12 in world frame; geometry is spawn-relative.
-# Zone 1 — main floor (bottom section of L)
-ZONE1_N = (-4.0, 16.0)
-ZONE1_E = (-12.0, 16.0)
-# Zone 2 — upper-left arm
-ZONE2_N = (16.0, 32.0)
-ZONE2_E = (-12.0, 0.0)
-# Zone 3 — upper-right arm
-ZONE3_N = (16.0, 32.0)
-ZONE3_E = (12.0, 28.0)
-# Inaccessible cutout between the two upper arms
-FORBIDDEN_N = (16.0, 36.0)
-FORBIDDEN_E = (0.0, 12.0)
-
-# Physical wall segments as ((n1,e1),(n2,e2)) pairs, spawn-relative.
-# Used for continuous geometric repulsion (works regardless of camera FOV).
-ARENA_WALL_SEGS_REL = [
-    ((-4.0, -12.0), (-4.0,  16.0)),   # south wall
-    ((-4.0,  16.0), (16.0,  16.0)),   # Zone1 east wall
-    ((16.0,  16.0), (16.0,  28.0)),   # Zone3 south step (E=16→E=28 at N=16)
-    ((16.0,  28.0), (32.0,  28.0)),   # Zone3 east wall
-    ((32.0,  28.0), (32.0,  12.0)),   # Zone3 north wall
-    ((32.0,  12.0), (16.0,  12.0)),   # cutout right inner wall (N=32→N=16 at E=12)
-    ((16.0,  12.0), (16.0,   0.0)),   # cutout bottom (N=16 at E=0→E=12)
-    ((16.0,   0.0), (32.0,   0.0)),   # cutout left inner wall (N=16→N=32 at E=0)
-    ((32.0,   0.0), (32.0, -12.0)),   # Zone2 north wall
-    ((32.0, -12.0), (-4.0, -12.0)),   # west wall
-]
-
-WALL_MARGIN  = 2.5   # stay this far from walls at all times
-W_WALL       = 1.0   # continuous geometric wall repulsion weight (Stage 2: 0.5→1.0)
-WALL_INF_M   = 5.0   # wall influence radius (Stage 2: 3.5→5.0 — starts repulsion earlier)
-WP_WALL_BUFFER = 1.0 # extra buffer beyond WALL_MARGIN when generating sweep WPs (Fix F)
-# ─────────────────────────────────────────────────────────────────────────────
-
-# RRT* path planning — runs once per waypoint leg in a background thread
-RRT_MAX_ITER = 500    # iterations per plan (balances quality vs latency)
-RRT_SAFETY_M = 1.0   # obstacle clearance margin (m)
-RRT_STEP_M   = 1.5   # tree extension step size (m)
-
-# Crash recovery (Phase 4)
-MAX_RESTARTS = 2      # max re-attempts within the 10-minute window
-
-# Altitudes
-ALT_YELLOW = 1.8    # low — ground-level yellow barrels visible in lower frame
-ALT_RED    = 4.5    # high — elevated red barrels come into camera FOV
-
-# Row spacing — wider than camera sightline since detection runs during flight
-ROW_SPACING_LOW  = 5.0   # was 3.0 — at 1.8m alt camera sees ~5m ahead
-ROW_SPACING_HIGH = 7.0   # was 5.0 — at 4.5m alt camera sees further
-
-CONTROL_HZ     = 20.0
-ARRIVAL_RADIUS = 1.0    # horizontal arrival threshold (m)
-ARRIVAL_ALT    = 0.5    # vertical arrival threshold (m)
-MISSION_LIMIT  = 600.0  # s — 10 min hard cap
-
-# Virtual target blending
-W_AVOID     = 0.5   # depth-camera avoidance weight
-W_MEM_AVOID = 0.3   # memory map avoidance weight
-
-# Avoidance
-SAFE_DIST = 3.0
-CRIT_DIST = 1.5
-
-# Map memory
-MAP_RETENTION_M = 15.0
-MAP_INFLUENCE_M = 4.5
-MAP_Z_MAX = 10.0
-
-# Velocity setpoint limits (Phase 1)
-VEL_MAX      = 1.0   # m/s — open space cruise speed
-VEL_MIN      = 0.3   # m/s — near obstacles / boundary recovery
-YAW_RATE_MAX = 15.0  # deg per control tick — prevents snapping to face a wall
-ALT_KP       = 2.0   # P-gain for altitude velocity controller
-ALT_VEL_MAX  = 0.5   # m/s — max vertical correction speed
-
-# Stuck detection
-STUCK_TIMEOUT_S = 10.0
-STUCK_DIST_M = 0.4
-STUCK_ESCAPE_M = 2.5
-
-# Detection confirmation
-DETECT_CONFIRM = 4
-
-# Carrot-point lookahead — drone targets a point this far ahead along the path,
-# not the raw WP. Shorter bursts = more responsive to local obstacles.
-LOOKAHEAD_DIST = 2.5   # m
-
-MERGE_DIST = 3.0
-
-# Map update throttle: update every N explore ticks (depth_to_xy_map subsamples 4x so cost is low)
-MAP_THROTTLE = 5
-
-# Visited grid
-CELL_SIZE     = 2.0          # m — grid cell resolution
-GRID_N_ORIGIN = ZONE1_N[0]   # -4.0  m — south edge relative to spawn NED
-GRID_E_ORIGIN = ZONE1_E[0]   # -12.0 m — west  edge relative to spawn NED
-GRID_N_CELLS  = 18           # ceil((ZONE2_N[1] - ZONE1_N[0]) / CELL_SIZE) = 36/2
-GRID_E_CELLS  = 20           # ceil((ZONE3_E[1] - ZONE1_E[0]) / CELL_SIZE) = 40/2
-
-# Stabilize sensor gate
-STABILIZE_TIMEOUT = 30.0  # s — abort if sensors not valid within this window
-
-CAM_K = np.array([
-    [433.0, 0.0, 320.0],
-    [0.0, 433.0, 240.0],
-    [0.0, 0.0, 1.0],
-])
-
-
-# ---------------------------------------------------------------------------
-# Mission state machine
-# ---------------------------------------------------------------------------
-class MissionState(Enum):
-    INIT = "INIT"
-    CONNECT = "CONNECT"
-    TAKEOFF = "TAKEOFF"
-    STABILIZE = "STABILIZE"
-    CENTERING = "CENTERING"
-    STARTUP_SCAN = "STARTUP_SCAN"
-    EXPLORE = "EXPLORE"
-    SCAN = "SCAN"
-    ESCAPE = "ESCAPE"
-    DONE = "DONE"
-    LAND = "LAND"
+# Configuration constants, arena geometry, and MissionState — see mission_config.py.
+# Pure navigation helpers (cardinal labels, segment math) — see nav_helpers.py.
+from mission_config import *  # noqa: F401,F403
+from nav_helpers import yaw_to_cardinal, sector_cardinals, nearest_on_seg
 
 
 # ---------------------------------------------------------------------------
@@ -204,8 +119,13 @@ class QualifierMission:
         self._origin_e = 0.0
 
         self._stuck_timer = time.monotonic()
+        self._wp_approach_start = time.monotonic()
+        self._wp_dest_checked: bool = False        # per-WP live obstacle check flag
         self._stuck_ref_n = 0.0
         self._stuck_ref_e = 0.0
+        self._last_min_clearance = SAFE_DIST  # updated each velocity tick (depth-camera)
+        self._last_map_clearance = SAFE_DIST  # updated each velocity tick (global map, 360°)
+        self._avoidance_since: float | None = None  # time entered CRIT avoidance zone
 
         self._yellow_streak = 0
         self._red_streak = 0
@@ -220,8 +140,20 @@ class QualifierMission:
         # Map update throttle counter
         self._map_tick = 0
 
+        # Path history for backtrack repulsion
+        self._path_history: list = []
+        self._path_hist_tick = 0
+
         # Time of last escape (for post-escape look-ahead reduction)
         self._last_escape_time = 0.0
+
+        # Last commanded velocity — shown in NAV status log for speed visibility
+        self._last_vn = 0.0
+        self._last_ve = 0.0
+
+        # EKF jump detector — tracks previous tick position
+        self._last_ekf_n: float | None = None
+        self._last_ekf_e: float | None = None
 
         # AVOID log throttle — print at most 1/s (every 20 ticks at 20 Hz)
         self._avoid_log_tick = 0
@@ -229,6 +161,16 @@ class QualifierMission:
         # BOUNDARY log throttle — print at most once per 2 s
         self._boundary_log_time = 0.0
 
+        # Altitude override: climbs when stuck in AVOID-CRIT for >10s
+        self._crit_alt_start: float | None = None
+        self._alt_bonus_m = 0.0
+        self._emerg_log_t = 0.0
+
+        # Consecutive AVOID frames — triggers LOOK_AROUND state when >TRIGGER
+        self._avoid_streak = 0
+
+        # NAV status log throttle — print at most once per 5 s during EXPLORE
+        self._nav_log_time = 0.0
 
         # OFFBOARD gate warn throttle
         self._offboard_warn_time = 0.0
@@ -248,6 +190,9 @@ class QualifierMission:
         self._was_flipped = False       # set True while flipping; triggers re-arm check when it clears
         self._flip_count = 0            # consecutive flips at current WP; resets on WP advance
         self._flip_start_time = 0.0     # monotonic when flip first detected; used for 5s timeout
+
+        # Cached first-leg path from Stage 2 validation — avoids redundant RRT* call
+        self._cached_first_leg_path = None
 
         # RRT* path planner (Phase 2)
         self._rrt = RRTStarPlanner(
@@ -481,10 +426,9 @@ class QualifierMission:
         Two-stage starting-WP selection:
           Stage 1 — heuristic shortlist: rank by 1/(1+obs_count+0.05*path_len)
                     with a 12m distance cap (fallback uncapped if no nearby WPs).
-          Stage 2 — RRT* validation: run RRT* in parallel for the top 5
-                    heuristic candidates. Pick the WP with a valid, shortest
-                    planned path. Falls back to heuristic winner if all RRT*
-                    fail (e.g. empty obstacle map).
+          Stage 2 — RRT* validation: run RRT* sequentially for the top 5
+                    heuristic candidates; stop at first valid path found.
+                    Falls back to heuristic winner if all RRT* fail.
 
         Why two stages: 360-scan map is sparse (~100 points). Heuristic score
         alone says nothing about *reachability* — a "low obs_count" path may
@@ -504,8 +448,14 @@ class QualifierMission:
         )
 
         # Stage 1 — heuristic shortlist (12m cap, uncapped fallback)
-        candidates = []   # list of (idx, score, path_len)
+        # Tuples: (idx, score, path_len, min_path_dist)
+        # min_path_dist = closest any obstacle comes to the direct path line.
+        # Hard filter: prefer paths with >PATH_CLEAR_M clearance from all obstacles;
+        # fall back to best available if nothing clears the threshold.
+        PATH_CLEAR_M = 2.0
+        candidates = []
         for dist_cap in (12.0, float("inf")):
+            raw = []
             for idx in order:
                 wp = waypoints[idx]
                 if self._is_near_wall(wp[0], wp[1], extra=0.5):
@@ -525,11 +475,23 @@ class QualifierMission:
                     closest_e = cur_e + t * path_e
                     dists_to_path = np.hypot(obs_pts[:, 0] - closest_n, obs_pts[:, 1] - closest_e)
                     obs_count = int(np.sum(dists_to_path < 1.5))
+                    min_path_dist = float(np.min(dists_to_path))
                 else:
                     obs_count = 0
+                    min_path_dist = float("inf")
                 score = 1.0 / (1.0 + obs_count + 0.05 * path_len)
-                candidates.append((idx, score, path_len))
-            if candidates:
+                raw.append((idx, score, path_len, min_path_dist))
+            if raw:
+                # Prefer paths whose direct line stays ≥ PATH_CLEAR_M from all obstacles
+                clear = [c for c in raw if c[3] >= PATH_CLEAR_M]
+                if clear:
+                    candidates = clear
+                else:
+                    # All paths pass near an obstacle — use best available clearance
+                    best_dist = max(c[3] for c in raw)
+                    candidates = [c for c in raw if c[3] >= best_dist * 0.9]
+                    print(f"[NAV] No path with >={PATH_CLEAR_M}m obstacle clearance "
+                          f"(best={best_dist:.1f}m, {len(candidates)} candidate(s))")
                 break
 
         if not candidates:
@@ -556,22 +518,37 @@ class QualifierMission:
 
         async def _plan_one(idx, wp):
             try:
-                path = await asyncio.to_thread(
-                    self._rrt.plan,
-                    [cur_n, cur_e],
-                    [wp[0], wp[1]],
-                    obs_for_rrt,
-                    bounds,
+                path = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._rrt.plan,
+                        [cur_n, cur_e],
+                        [wp[0], wp[1]],
+                        obs_for_rrt,
+                        bounds,
+                    ),
+                    timeout=6.0,
                 )
                 return (idx, path)
-            except Exception as e:
-                print(f"[NAV] RRT* validation WP {idx} threw: {e}")
+            except (Exception, asyncio.TimeoutError) as e:
+                print(f"[NAV] RRT* validation WP {idx} skipped: {e}")
                 return (idx, None)
 
-        print(f"[NAV] Validating top {len(top_k)} WP candidates with RRT*...")
-        results = await asyncio.gather(
-            *[_plan_one(c[0], waypoints[c[0]]) for c in top_k]
-        )
+        print(f"[NAV] Validating top {len(top_k)} WP candidates with RRT* "
+              f"(map={obs_pts.shape[0]}pts iter={RRT_MAX_ITER})...")
+        # Sequential — concurrent threads fight for Python GIL and all timeout.
+        # Stop at first valid path found (Stage 1 score already ranked candidates).
+        results = []
+        for c in top_k:
+            r = await _plan_one(c[0], waypoints[c[0]])
+            results.append(r)
+            if r[1] is not None:
+                for rc in top_k[len(results):]:
+                    results.append((rc[0], None))
+                break
+
+        # Pre-compute obstacle positions for destination clearance check
+        dest_obs = self.mapper.get_global_points()
+        MIN_WP_DEST_CLEARANCE = 2.5  # WP destination must be this far from any obstacle
 
         valid = []
         for idx, path in results:
@@ -580,19 +557,51 @@ class QualifierMission:
             total = 0.0
             for i in range(len(path) - 1):
                 total += math.hypot(path[i+1][0] - path[i][0], path[i+1][1] - path[i][1])
+            # Reject WP if destination is inside an obstacle cluster —
+            # reactive layer will deadlock against obstacles before drone arrives
+            if dest_obs.shape[0] > 0:
+                wp_n, wp_e = waypoints[idx][0], waypoints[idx][1]
+                dists = np.linalg.norm(dest_obs - np.array([[wp_n, wp_e]]), axis=1)
+                if np.min(dists) < MIN_WP_DEST_CLEARANCE:
+                    print(f"[NAV] WP {idx} rejected — destination too close to obstacle "
+                          f"(min_dist={np.min(dists):.1f}m < {MIN_WP_DEST_CLEARANCE}m)")
+                    continue
             valid.append((idx, total))
 
         if valid:
             valid.sort(key=lambda v: v[1])
             best_idx, best_len = valid[0]
             wp = waypoints[best_idx]
+            # Cache the winning path so _plan_first_leg can reuse it without
+            # running another RRT* that would compete with zombie threads from
+            # the timed-out concurrent _plan_one calls above.
+            self._cached_first_leg_path = next(
+                (path for ridx, path in results if ridx == best_idx and path is not None),
+                None,
+            )
             print(
                 f"[NAV] RRT*-validated start: WP {best_idx} "
                 f"N={wp[0]:.1f} E={wp[1]:.1f} path={best_len:.1f}m "
                 f"({len(valid)}/{len(top_k)} candidates feasible)"
             )
         else:
-            best_idx = candidates[0][0]
+            # All RRT* failed — no cached path to reuse
+            self._cached_first_leg_path = None
+            # Still apply dest clearance to heuristic list
+            best_idx = None
+            for c in candidates:
+                idx = c[0]
+                wp_n, wp_e = waypoints[idx][0], waypoints[idx][1]
+                if dest_obs.shape[0] > 0:
+                    dists = np.linalg.norm(dest_obs - np.array([[wp_n, wp_e]]), axis=1)
+                    if np.min(dists) < MIN_WP_DEST_CLEARANCE:
+                        print(f"[NAV] Heuristic WP {idx} rejected — dest too close to obstacle "
+                              f"(min={np.min(dists):.1f}m)")
+                        continue
+                best_idx = idx
+                break
+            if best_idx is None:
+                best_idx = candidates[0][0]  # last resort — all fail clearance
             wp = waypoints[best_idx]
             print(
                 f"[NAV] All {len(top_k)} RRT* validations failed — "
@@ -604,8 +613,9 @@ class QualifierMission:
     async def _plan_first_leg(self):
         """RRT* from current pose to current WP 0. Inserts intermediate
         sub-WPs at index 0 so the drone navigates around known obstacles
-        for the first leg instead of going straight — direct paths often run
-        into pillars between spawn and the first WP."""
+        for the first leg instead of going straight.
+        First tries to reuse the Stage 2 validation path to avoid redundant
+        RRT* and zombie-thread CPU contention."""
         if not self._waypoints:
             return False
         p = self._pose()
@@ -613,35 +623,89 @@ class QualifierMission:
             return False
 
         target_wp = self._waypoints[0]
+        alt_d = target_wp[2]
+
+        # Fast path: Stage 2 already computed a route — reuse it.
+        cached = getattr(self, '_cached_first_leg_path', None)
+        if cached is not None and len(cached) > 2:
+            self._cached_first_leg_path = None
+            intermediate = [(float(pt[0]), float(pt[1]), alt_d) for pt in cached[1:-1]]
+            if intermediate:
+                self._waypoints = intermediate + self._waypoints
+                print(f"[NAV] T={self._elapsed():.0f}s  First-leg: reusing Stage 2 path "
+                      f"({len(intermediate)} sub-WPs)")
+                return True
+
+        self._cached_first_leg_path = None
+
+        # Slow path: run fresh RRT* (zombie threads may still be running, so use 12s timeout)
         obs_pts = self.mapper.get_global_points()
         if obs_pts.shape[0] == 0:
             obs_pts = np.array([[self._n_max + 100, self._e_max + 100]])
         bounds = np.array([[self._n_min, self._n_max], [self._e_min, self._e_max]])
 
         try:
-            path = await asyncio.to_thread(
-                self._rrt.plan,
-                [p["north"], p["east"]],
-                [target_wp[0], target_wp[1]],
-                obs_pts,
-                bounds,
+            path = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._rrt.plan,
+                    [p["north"], p["east"]],
+                    [target_wp[0], target_wp[1]],
+                    obs_pts,
+                    bounds,
+                ),
+                timeout=12.0,
             )
-        except Exception as e:
-            print(f"[NAV] First-leg RRT* threw: {e}")
+        except (Exception, asyncio.TimeoutError) as e:
+            print(f"[NAV] T={self._elapsed():.0f}s  First-leg RRT* skipped: {type(e).__name__}")
             return False
 
         if path is None or len(path) <= 2:
-            print("[NAV] First-leg RRT* trivial path — using direct route")
+            print(f"[NAV] T={self._elapsed():.0f}s  First-leg RRT* trivial/failed — direct route")
             return False
 
-        alt_d = target_wp[2]
         intermediate = [(float(pt[0]), float(pt[1]), alt_d) for pt in path[1:-1]]
         if not intermediate:
             return False
 
         self._waypoints = intermediate + self._waypoints
-        print(f"[NAV] First-leg planned: {len(intermediate)} sub-WPs inserted before WP 0")
+        print(f"[NAV] T={self._elapsed():.0f}s  First-leg fresh RRT*: "
+              f"{len(intermediate)} sub-WPs inserted")
         return True
+
+    # ------------------------------------------------------------------
+    # Phase-transition scan — climb to target altitude then full 360° scan.
+    # Call before _start_phase("RED") so Zone 2/3 obstacles are mapped
+    # before the drone flies into unknown territory.
+    # ------------------------------------------------------------------
+    async def _phase_transition_scan(self, target_alt_m, timeout=20.0):
+        p = self._pose()
+        if p is None:
+            return
+        target_d = -target_alt_m
+        print(f"[TRANS] Climbing to {target_alt_m:.1f}m for pre-phase scan")
+
+        # Climb to target altitude while holding XY
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            p = self._pose()
+            if p is None:
+                await asyncio.sleep(0.1)
+                continue
+            if abs(p["down"] - target_d) < 0.4:
+                break
+            await self.drone.send_position_setpoint(p["north"], p["east"], target_d, p["yaw_deg"])
+            await asyncio.sleep(0.1)
+
+        # Clear Phase 1 floor-level obstacles — at 4.5m the drone flies above most of them.
+        # Keeping the Phase 1 map fills the 4.5m-altitude area with phantom obstacles,
+        # making the drone appear trapped even in open space.
+        print("[TRANS] Clearing Phase 1 obstacle map before altitude scan")
+        self.mapper.clear()
+
+        # 360° scan at new altitude — rebuilds map from 4.5m perspective
+        await self._startup_scan()
+        pts = self.mapper.get_global_points()
+        print(f"[TRANS] Pre-phase scan done — {pts.shape[0]} obstacle pts in map")
 
     # ------------------------------------------------------------------
     # Startup 360° scan — rotate relative to current yaw and seed GlobalMapper
@@ -744,13 +808,29 @@ class QualifierMission:
     # ------------------------------------------------------------------
     # Sweep waypoint generation
     # ------------------------------------------------------------------
-    def _build_zone_sweep(self, altitude, row_spacing):
+    def _filter_obstacle_wps(self, waypoints, min_clearance=3.5):
+        """Remove sweep WPs that land inside or too close to known obstacles."""
+        obs = self.mapper.get_global_points()
+        if obs.shape[0] == 0:
+            return waypoints
+        kept = []
+        for wp in waypoints:
+            dists = np.linalg.norm(obs - np.array([[wp[0], wp[1]]]), axis=1)
+            if np.min(dists) >= min_clearance:
+                kept.append(wp)
+        removed = len(waypoints) - len(kept)
+        if removed > 0:
+            print(f"[NAV] Filtered {removed}/{len(waypoints)} sweep WPs inside obstacle clusters")
+        return kept if kept else waypoints  # fallback: keep all if all removed
+
+    def _build_zone_sweep(self, altitude, row_spacing, zones=None):
         down = -altitude
-        zones = [
-            (ZONE1_N, ZONE1_E),
-            (ZONE2_N, ZONE2_E),
-            (ZONE3_N, ZONE3_E),
-        ]
+        if zones is None:
+            zones = [
+                (ZONE1_N, ZONE1_E),
+                (ZONE2_N, ZONE2_E),
+                (ZONE3_N, ZONE3_E),
+            ]
         wps = []
         # WPs sit at WALL_MARGIN + WP_WALL_BUFFER from walls — extra buffer keeps
         # the drone from skimming wall margins (the prior margin-flush layout put
@@ -779,6 +859,21 @@ class QualifierMission:
     # ------------------------------------------------------------------
     # Waypoint management
     # ------------------------------------------------------------------
+    def _nearest_unvisited_wp(self, cur_n, cur_e):
+        """Return index of nearest unvisited WP by Euclidean distance (search from wp_idx+1).
+        Prevents backtracking across the arena when next-in-list WP is on the opposite side."""
+        best_i = None
+        best_dist = float('inf')
+        for i in range(self._wp_idx + 1, len(self._waypoints)):
+            wp = self._waypoints[i]
+            ci, cj = self._ned_to_cell(wp[0], wp[1])
+            if self._valid_cell(ci, cj) and self._grid[ci][cj].visited_count == 0:
+                d = math.hypot(wp[0] - cur_n, wp[1] - cur_e)
+                if d < best_dist:
+                    best_dist = d
+                    best_i = i
+        return best_i
+
     def _current_wp(self):
         return self._waypoints[self._wp_idx] if self._wp_idx < len(self._waypoints) else None
 
@@ -792,15 +887,20 @@ class QualifierMission:
 
     def _advance_wp(self):
         self._wp_idx += 1
+        self._wp_approach_start = time.monotonic()
+        self._wp_dest_checked = False
         self._reset_stuck()
         if self._consecutive_stuck > 0:
             self._consecutive_stuck = 0   # arriving at any WP = made progress
         self._flip_count = 0
         wp = self._current_wp()
         if wp:
-            print(f"[NAV] WP {self._wp_idx}/{len(self._waypoints)}  "
-                  f"N={wp[0]:.1f} E={wp[1]:.1f} Alt={-wp[2]:.1f}m  "
-                  f"T={self._time_left():.0f}s  {self.tracker.summary()}  "
+            p_adv = self._pose()
+            pos_str = (f"from=({p_adv['north']:.1f},{p_adv['east']:.1f})"
+                       if p_adv else "from=?")
+            print(f"[NAV] T={self._elapsed():.0f}s  ADVANCE→WP {self._wp_idx}/{len(self._waypoints)}  "
+                  f"{pos_str}  →N={wp[0]:.1f} E={wp[1]:.1f} Alt={-wp[2]:.1f}m  "
+                  f"Tleft={self._time_left():.0f}s  {self.tracker.summary()}  "
                   f"{self._coverage_summary()}")
         # Background plan for the leg AFTER the one we just started
         self._start_rrt_plan(self._wp_idx, self._wp_idx + 1)
@@ -808,16 +908,33 @@ class QualifierMission:
     async def _start_phase(self, phase):
         self._phase = phase
         if phase == "YELLOW":
-            wps = self._build_zone_sweep(ALT_YELLOW, ROW_SPACING_LOW)
+            # Yellow phase: Zone 1 only (ground-level yellow barrels).
+            # Zone 2/3 are upper zones — swept at 4.5m during Red phase.
+            # Sweeping them here at 1.8m wastes ~5 min on unreachable WPs.
+            wps = self._build_zone_sweep(ALT_YELLOW, ROW_SPACING_LOW,
+                                         zones=[(ZONE1_N, ZONE1_E)])
+            wps = self._filter_obstacle_wps(wps)
             self._waypoints = await self._rotate_waypoints_to_most_open(wps)
-            print(f"\n[PHASE 1] Yellow sweep  alt={ALT_YELLOW}m  "
+            print(f"\n[PHASE 1] Yellow sweep  alt={ALT_YELLOW}m  Zone 1 only  "
                   f"{len(self._waypoints)} waypoints")
         else:
-            wps = self._build_zone_sweep(ALT_RED, ROW_SPACING_HIGH)
+            # Red phase: transition strip in northern Zone 1 → Zone 2+3.
+            # The transition strip (N=8→16, full E width) guides the drone from Zone 1
+            # center toward the Zone 2/3 passages before attempting distant Zone 2+3 WPs.
+            # Without this, Phase 2 WPs (N=28.5) are unreachable from (N=4, E=0) directly.
+            ZONE1_NORTH_STRIP_N = (8.0, 16.0)   # northern slice of Zone 1
+            ZONE1_NORTH_STRIP_E = (-12.0, 16.0)
+            trans_wps = self._build_zone_sweep(ALT_RED, ROW_SPACING_HIGH,
+                                               zones=[(ZONE1_NORTH_STRIP_N, ZONE1_NORTH_STRIP_E)])
+            zone_wps = self._build_zone_sweep(ALT_RED, ROW_SPACING_HIGH,
+                                              zones=[(ZONE2_N, ZONE2_E), (ZONE3_N, ZONE3_E)])
+            wps = trans_wps + zone_wps
+            wps = self._filter_obstacle_wps(wps)
             self._waypoints = await self._rotate_waypoints_to_most_open(wps)
-            print(f"\n[PHASE 2] Red sweep  alt={ALT_RED}m  "
-                  f"{len(self._waypoints)} waypoints")
+            print(f"\n[PHASE 2] Red sweep  alt={ALT_RED}m  trans+Zone2+3  "
+                  f"{len(self._waypoints)} waypoints ({len(trans_wps)} transition)")
         self._wp_idx        = 0
+        self._wp_approach_start = time.monotonic()
         self._yellow_streak = 0
         self._red_streak    = 0
         self._reset_stuck()
@@ -840,6 +957,7 @@ class QualifierMission:
         self._stuck_timer = time.monotonic()
         self._stuck_ref_n = p["north"]
         self._stuck_ref_e = p["east"]
+        self._avoidance_since = None
 
     def _check_stuck(self):
         p = self._pose()
@@ -851,6 +969,19 @@ class QualifierMission:
             return False
         if p["down"] > -0.3:  # NED: down < 0 when above ground; -0.3 = ~30 cm
             return False
+        # When obstacles are within CRIT_DIST, drone may be navigating around them
+        # slowly — suppress stuck for up to 15s. After 15s still in CRIT avoidance
+        # with no escape, treat as genuinely cornered and allow stuck to fire.
+        if getattr(self, '_last_min_clearance', SAFE_DIST) < CRIT_DIST:
+            if self._avoidance_since is None:
+                self._avoidance_since = time.monotonic()
+            if time.monotonic() - self._avoidance_since < 4.0:  # was 8.0
+                self._stuck_timer = time.monotonic()
+                return False
+            # 8s elapsed in CRIT zone → fall through to normal stuck check
+        else:
+            self._avoidance_since = None
+
         moved = math.hypot(p["north"] - self._stuck_ref_n,
                            p["east"]  - self._stuck_ref_e)
         if moved >= STUCK_DIST_M:
@@ -886,14 +1017,7 @@ class QualifierMission:
     # ------------------------------------------------------------------
     # Wall repulsion — geometric, FOV-independent (Phase 2)
     # ------------------------------------------------------------------
-    @staticmethod
-    def _nearest_on_seg(n, e, n1, e1, n2, e2):
-        dn, de = n2 - n1, e2 - e1
-        seg_sq = dn * dn + de * de
-        if seg_sq < 1e-9:
-            return n1, e1
-        t = max(0.0, min(1.0, ((n - n1) * dn + (e - e1) * de) / seg_sq))
-        return n1 + t * dn, e1 + t * de
+    _nearest_on_seg = staticmethod(nearest_on_seg)
 
     def _compute_wall_repulsion(self, n, e):
         """Unit repulsion vector from all wall segments within WALL_INF_M."""
@@ -923,7 +1047,14 @@ class QualifierMission:
 
         n_min, n_max = self._n_min, self._n_max
         e_min, e_max = self._e_min, self._e_max
-        rrt = self._rrt
+        # Use fewer iterations for background plans — reduces GIL contention with
+        # gz.transport callbacks that causes "User callback queue slow" spam.
+        # Direct route is the fallback anyway, so quality loss is acceptable.
+        _flight_rrt = RRTStarPlanner(
+            safety_margin=RRT_SAFETY_M,
+            step_size=RRT_STEP_M,
+            max_iter=RRT_FLIGHT_ITER,
+        )
 
         def _plan_sync():
             # KDTree needs ≥1 point; use a dummy far away when map is empty
@@ -932,7 +1063,7 @@ class QualifierMission:
             else:
                 obs_pts = obs_snap
             bounds = np.array([[n_min, n_max], [e_min, e_max]])
-            return rrt.plan(
+            return _flight_rrt.plan(
                 start=[from_wp[0], from_wp[1]],
                 goal=[to_wp[0], to_wp[1]],
                 obstacle_points=obs_pts,
@@ -963,15 +1094,18 @@ class QualifierMission:
         bounds = np.array([[self._n_min, self._n_max], [self._e_min, self._e_max]])
 
         try:
-            path = await asyncio.to_thread(
-                self._rrt.plan,
-                [p["north"], p["east"]],
-                [target_wp[0], target_wp[1]],
-                obs_pts,
-                bounds,
+            path = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._rrt.plan,
+                    [p["north"], p["east"]],
+                    [target_wp[0], target_wp[1]],
+                    obs_pts,
+                    bounds,
+                ),
+                timeout=6.0,
             )
-        except Exception as e:
-            print(f"[REPLAN] RRT* threw: {e}")
+        except (Exception, asyncio.TimeoutError) as e:
+            print(f"[REPLAN] RRT* skipped: {e}")
             return False
 
         if path is None or len(path) <= 2:
@@ -1067,16 +1201,98 @@ class QualifierMission:
             print(f"[RRT*] Inserted {len(intermediate)} sub-WPs before WP {self._rrt_for_wp}")
 
     # ------------------------------------------------------------------
+    # Open-space direction finder — used when all depth sectors are critical
+    # ------------------------------------------------------------------
+    # Thin wrappers — actual implementation lives in nav_helpers.py.
+    _yaw_to_cardinal  = staticmethod(yaw_to_cardinal)
+    _sector_cardinals = staticmethod(sector_cardinals)
+
+    def _find_open_escape_direction(self, cur_n, cur_e, goal_n, goal_e):
+        """
+        Cast 16 rays from current position. For each ray, compute the minimum
+        lateral clearance from obstacles in GlobalMapper along the first 6m.
+        Pick direction with highest clearance + small goal-alignment bonus.
+
+        This replaces memory-repulsion in the all_critical case so the drone
+        actively seeks open space rather than bouncing off obstacles.
+        Returns (dn, de) unit vector.
+        """
+        obs = self.mapper.get_global_points()
+        goal_mag = math.hypot(goal_n, goal_e)
+        gn = goal_n / goal_mag if goal_mag > 1e-3 else 1.0
+        ge = goal_e / goal_mag if goal_mag > 1e-3 else 0.0
+
+        if obs.shape[0] == 0:
+            return gn, ge
+
+        # Only obstacles within 8m matter
+        d_all = np.hypot(obs[:, 0] - cur_n, obs[:, 1] - cur_e)
+        nearby = obs[d_all < 8.0]
+        if nearby.shape[0] == 0:
+            return gn, ge
+
+        n_rays = 16
+        best_score = -float('inf')
+        best_dn, best_de = gn, ge
+
+        for i in range(n_rays):
+            angle = 2.0 * math.pi * i / n_rays
+            dn = math.cos(angle)
+            de = math.sin(angle)
+
+            # Project nearby obstacles onto this ray
+            proj = (nearby[:, 0] - cur_n) * dn + (nearby[:, 1] - cur_e) * de
+            diff_n = (nearby[:, 0] - cur_n) - proj * dn
+            diff_e = (nearby[:, 1] - cur_e) - proj * de
+            lat = np.hypot(diff_n, diff_e)
+
+            # Obstacles ahead on this ray within 6m
+            ahead = (proj > 0.05) & (proj < 6.0)
+            min_lat = float(np.min(lat[ahead])) if np.any(ahead) else 6.0
+
+            # Goal-alignment bonus (-1 to +1)
+            align = dn * gn + de * ge
+
+            # Clearance dominates; goal bonus breaks ties
+            score = min_lat + 0.35 * align
+
+            if score > best_score:
+                best_score = score
+                best_dn, best_de = dn, de
+
+        return best_dn, best_de
+
+    # ------------------------------------------------------------------
     # Velocity setpoint — goal + avoidance + memory + wall blend → (vn, ve, vd, yaw)
     # ------------------------------------------------------------------
     def _compute_velocity_setpoint(self, pose, target_n, target_e, target_d, depth):
         cur_n, cur_e = pose["north"], pose["east"]
         cur_yaw = pose["yaw_deg"]
 
-        # Emergency: near wall/forbidden — push toward zone 1 centre at VEL_MIN
-        if self._is_near_wall(cur_n, cur_e, extra=0.0):
+        # Emergency: outside outer arena walls — push toward zone 1 centre at VEL_MIN.
+        # Does NOT include forbidden zone check — forbidden zone is handled by wall repulsion
+        # from the cutout wall segments in ARENA_WALL_SEGS_REL. Including _in_forbidden here
+        # (with margin=WALL_MARGIN=2.5m) expands the forbidden zone SOUTH to N=13.5, which
+        # blocks the only passages to Zone 2/3 and traps the drone in Zone 1 permanently.
+        _outside_outer_walls = (cur_n < self._n_min or cur_n > self._n_max or
+                                 cur_e < self._e_min or cur_e > self._e_max)
+        if _outside_outer_walls:
             safe_n = self._origin_n + (ZONE1_N[0] + ZONE1_N[1]) / 2.0
             safe_e = self._origin_e + (ZONE1_E[0] + ZONE1_E[1]) / 2.0
+
+            # Guard: if EKF reports position impossibly far from arena (corruption),
+            # chasing the "safe" center from a wrong position oscillates wildly.
+            # Just hover and let EKF jump detector handle it.
+            dist_from_safe = math.hypot(cur_n - safe_n, cur_e - safe_e)
+            _now = time.monotonic()
+            if dist_from_safe > 60.0:
+                if _now - self._boundary_log_time >= 5.0:
+                    print(f"[BOUNDARY] T={self._elapsed():.0f}s  EKF position "
+                          f"({cur_n:.1f},{cur_e:.1f}) implausibly far — hovering (EKF corrupt?)")
+                    self._boundary_log_time = _now
+                vd = max(-ALT_VEL_MAX, min(ALT_VEL_MAX, ALT_KP * (target_d - pose["down"])))
+                return 0.0, 0.0, vd, cur_yaw
+
             dn = safe_n - cur_n
             de = safe_e - cur_e
             mag = math.hypot(dn, de)
@@ -1085,9 +1301,9 @@ class QualifierMission:
                 de /= mag
             yaw = math.degrees(math.atan2(de, dn))
             vd = max(-ALT_VEL_MAX, min(ALT_VEL_MAX, ALT_KP * (target_d - pose["down"])))
-            _now = time.monotonic()
-            if _now - self._boundary_log_time >= 2.0:
-                print(f"[BOUNDARY] Near wall/forbidden at N={cur_n:.1f} E={cur_e:.1f} — recovering")
+            if _now - self._boundary_log_time >= 5.0:
+                print(f"[BOUNDARY] T={self._elapsed():.0f}s  "
+                      f"({cur_n:.1f},{cur_e:.1f}) near wall — recovering to ({safe_n:.1f},{safe_e:.1f})")
                 self._boundary_log_time = _now
             return VEL_MIN * dn, VEL_MIN * de, vd, yaw
 
@@ -1117,30 +1333,60 @@ class QualifierMission:
             right_clearance  = info["clearance"]["right"]
             if blocked:
                 self._avoid_log_tick += 1
-                if self._avoid_log_tick % 20 == 1:  # ~1 Hz at 20 Hz control loop
+                if self._avoid_log_tick % 45 == 1:  # ~3s between prints
                     cl = info["clearance"]
-                    print(f"[AVOID] L={cl['left']:.1f} C={cl['center']:.1f} "
-                          f"R={cl['right']:.1f}")
+                    fwd_c, left_c, right_c = self._sector_cardinals(cur_yaw)
+                    facing = self._yaw_to_cardinal(cur_yaw)
+                    goal_c = self._yaw_to_cardinal(
+                        math.degrees(math.atan2(goal_e, goal_n)))
+                    if cl['center'] < 0.6 or min(cl['left'], cl['right']) < 0.5:
+                        action = "→ EMERG slide (handled below)"
+                    elif cl['left'] < cl['right']:
+                        action = f"→ steer RIGHT (avoid {left_c} wall {cl['left']:.1f}m)"
+                    else:
+                        action = f"→ steer LEFT (avoid {right_c} wall {cl['right']:.1f}m)"
+                    print(f"[AVOID] T={self._elapsed():.0f}s  facing={facing}  goal={goal_c}  "
+                          f"pos=({cur_n:.1f},{cur_e:.1f})  "
+                          f"{left_c}={cl['left']:.1f}m  "
+                          f"{fwd_c}={cl['center']:.1f}m  "
+                          f"{right_c}={cl['right']:.1f}m  "
+                          f"{action}")
 
         # Emergency: obstacle < 0.6 m ahead OR < 0.5 m to either side.
-        # Pure hover (vn=ve=0) lets the drone sit next to the obstacle until
-        # stuck-timeout fires (~10 s wasted). Instead back away at VEL_MIN
-        # opposite the closest-obstacle direction so the drone unsticks itself.
+        # Slide TOWARD the most open sector rather than backing away — avoids
+        # retreating to positions the drone already came from.
         if center_clearance < 0.6 or min(left_clearance, right_clearance) < 0.5:
             yaw_rad = math.radians(cur_yaw)
-            # NED clockwise convention: forward=(cos,sin), left=yaw-90°, right=yaw+90°
             fwd_n,  fwd_e  = math.cos(yaw_rad), math.sin(yaw_rad)
             left_n, left_e = math.cos(yaw_rad - math.pi / 2), math.sin(yaw_rad - math.pi / 2)
             right_n, right_e = math.cos(yaw_rad + math.pi / 2), math.sin(yaw_rad + math.pi / 2)
             sectors = [
-                (center_clearance, fwd_n,  fwd_e),
-                (left_clearance,   left_n, left_e),
-                (right_clearance,  right_n, right_e),
+                (center_clearance, fwd_n,  fwd_e,  "FWD"),
+                (left_clearance,   left_n, left_e,  "LEFT"),
+                (right_clearance,  right_n, right_e, "RIGHT"),
             ]
-            _, obs_n, obs_e = min(sectors, key=lambda s: s[0])
-            back_n, back_e = -obs_n, -obs_e
+            best_clr,  best_n,  best_e,  best_lbl  = max(sectors, key=lambda s: s[0])
+            worst_clr, worst_n, worst_e, worst_lbl = min(sectors, key=lambda s: s[0])
             vd = max(-ALT_VEL_MAX, min(ALT_VEL_MAX, ALT_KP * (target_d - pose["down"])))
-            return VEL_MIN * back_n, VEL_MIN * back_e, vd, cur_yaw
+            if best_clr > SAFE_DIST:
+                # Open sector available — slide into it immediately
+                slide_n, slide_e = best_n, best_e
+                action_str = f"SLIDE→{best_lbl} ({best_clr:.1f}m open)"
+            else:
+                # All sectors tight — back away from worst
+                slide_n, slide_e = -worst_n, -worst_e
+                action_str = f"BACK from {worst_lbl} ({worst_clr:.1f}m)"
+            _now_em = time.monotonic()
+            if _now_em - self._emerg_log_t >= 2.0:
+                fwd_c, left_c, right_c = self._sector_cardinals(cur_yaw)
+                print(f"[AVOID-EMERG] T={self._elapsed():.0f}s  "
+                      f"facing={self._yaw_to_cardinal(cur_yaw)}  "
+                      f"{left_c}={left_clearance:.1f}m  "
+                      f"{fwd_c}={center_clearance:.1f}m  "
+                      f"{right_c}={right_clearance:.1f}m  "
+                      f"→ {action_str}")
+                self._emerg_log_t = _now_em
+            return VEL_MIN * slide_n, VEL_MIN * slide_e, vd, cur_yaw
 
         # Memory-map repulsion from GlobalMapper
         mem_n, mem_e = self.mapper.get_repulsion_vector(cur_n, cur_e, MAP_INFLUENCE_M)
@@ -1150,6 +1396,31 @@ class QualifierMission:
         # Geometric wall repulsion — always active, no camera FOV dependency
         wall_n, wall_e = self._compute_wall_repulsion(cur_n, cur_e)
 
+        # Path history repulsion — penalize returning to recently visited positions.
+        # Pushes drone away from cells it flew through in the last ~16s, preventing
+        # circles and backtracking. Heavy weight (W_PATH_HIST=1.5) per user request.
+        hist_n, hist_e = 0.0, 0.0
+        if self._path_history:
+            for (hn, he) in self._path_history:
+                hd = math.hypot(cur_n - hn, cur_e - he)
+                if 0.3 < hd < PATH_HIST_INFL:
+                    w = 1.0 - hd / PATH_HIST_INFL
+                    hist_n += w * (cur_n - hn) / hd
+                    hist_e += w * (cur_e - he) / hd
+            hmag = math.hypot(hist_n, hist_e)
+            if hmag > 1e-6:
+                hist_n /= hmag
+                hist_e /= hmag
+
+        # Origin (spawn) repulsion — heavy penalty for returning to start.
+        # Drone keeps wandering back to spawn; this kills that pattern.
+        orig_n, orig_e = 0.0, 0.0
+        od = math.hypot(cur_n - self._origin_n, cur_e - self._origin_e)
+        if 0.3 < od < ORIGIN_INFL_M:
+            w_orig = 1.0 - od / ORIGIN_INFL_M
+            orig_n = w_orig * (cur_n - self._origin_n) / od
+            orig_e = w_orig * (cur_e - self._origin_e) / od
+
         # All three sectors critical — use memory repulsion to escape obstacle cluster
         all_critical = (left_clearance < CRIT_DIST and center_clearance < CRIT_DIST
                         and right_clearance < CRIT_DIST)
@@ -1158,24 +1429,66 @@ class QualifierMission:
         # Corner clips happen because center is clear but a side is close — using
         # center-only let the drone fly full speed into a wall corner.
         min_clearance = min(center_clearance, left_clearance, right_clearance)
+        self._last_min_clearance = min_clearance
 
-        # In open space, reduce avoidance weight so goal vector dominates
+        # Map-based proximity — 360° awareness regardless of camera FOV.
+        # When the drone rounds a corner, the camera hasn't seen the new pillar face
+        # yet, but the map already has those points from the startup scan.
+        obs_pts_vel = self.mapper.get_global_points()
+        if obs_pts_vel.shape[0] > 0:
+            _dists = np.hypot(obs_pts_vel[:, 0] - cur_n, obs_pts_vel[:, 1] - cur_e)
+            map_clearance = float(np.min(_dists))
+        else:
+            map_clearance = SAFE_DIST
+        self._last_map_clearance = map_clearance
+
+        # Dynamic memory-repulsion weight: ramps from W_MEM_AVOID up to 1.0 as
+        # map-known obstacles close in (helps avoid unseen pillar faces on corners).
+        # Capped at 1.0 — was 2.0, which overpowered goal and caused wandering.
+        if map_clearance < SAFE_DIST:
+            _t_map = max(0.0, 1.0 - map_clearance / SAFE_DIST)
+            w_mem_dyn = W_MEM_AVOID + _t_map * (1.0 - W_MEM_AVOID)
+        else:
+            w_mem_dyn = W_MEM_AVOID
+
+        # Speed and w_avoid use camera clearance ONLY (not map).
+        # Map clearance is too dense to use for speed — it permanently reports
+        # <SAFE_DIST and locks drone into VEL_MIN crawl the entire mission.
         w_avoid = 0.1 if min_clearance >= SAFE_DIST else W_AVOID
 
         # Blend: goal + avoidance + memory + wall
         if all_critical:
-            if abs(mem_n) > 1e-3 or abs(mem_e) > 1e-3:
-                blend_n = mem_n + W_WALL * wall_n
-                blend_e = mem_e + W_WALL * wall_e
-            else:
-                blend_n = avoid_n + W_WALL * wall_n
-                blend_e = avoid_e + W_WALL * wall_e
-        elif blocked:
-            blend_n = avoid_n + W_MEM_AVOID * mem_n + W_WALL * wall_n
-            blend_e = avoid_e + W_MEM_AVOID * mem_e + W_WALL * wall_e
+            # All depth sectors blocked — seek most open direction in map
+            open_n, open_e = self._find_open_escape_direction(
+                cur_n, cur_e, goal_n, goal_e
+            )
+            if self._avoid_log_tick % 45 == 1:
+                open_card = self._yaw_to_cardinal(math.degrees(math.atan2(open_e, open_n)))
+                goal_card = self._yaw_to_cardinal(math.degrees(math.atan2(goal_e, goal_n)))
+                fwd_c, left_c, right_c = self._sector_cardinals(cur_yaw)
+                print(f"[AVOID] T={self._elapsed():.0f}s  ALL SECTORS BLOCKED  "
+                      f"facing={self._yaw_to_cardinal(cur_yaw)}  "
+                      f"pos=({cur_n:.1f},{cur_e:.1f})  "
+                      f"{left_c}={left_clearance:.1f}m  "
+                      f"{fwd_c}={center_clearance:.1f}m  "
+                      f"{right_c}={right_clearance:.1f}m  "
+                      f"→ seek open={open_card}  goal={goal_card}")
+            blend_n = (open_n + W_WALL * wall_n + W_PATH_HIST * hist_n
+                       + W_ORIGIN_REPEL * orig_n)
+            blend_e = (open_e + W_WALL * wall_e + W_PATH_HIST * hist_e
+                       + W_ORIGIN_REPEL * orig_e)
         else:
-            blend_n = goal_n + w_avoid * avoid_n + W_MEM_AVOID * mem_n + W_WALL * wall_n
-            blend_e = goal_e + w_avoid * avoid_e + W_MEM_AVOID * mem_e + W_WALL * wall_e
+            # Binary goal weight: full drive toward WP unless camera is blocked.
+            # SOFT_DIST gradual ramp caused goal_w=0.5 in normal corridors
+            # (cam_clr~1.4m), which stalled the drone immediately. SOFT_DIST
+            # is kept for yaw tilt only (gives depth camera earlier side-wall view).
+            goal_w = 0.4 if blocked else 1.0
+            blend_n = (goal_w * goal_n + w_avoid * avoid_n + w_mem_dyn * mem_n
+                       + W_WALL * wall_n + W_PATH_HIST * hist_n
+                       + W_ORIGIN_REPEL * orig_n)
+            blend_e = (goal_w * goal_e + w_avoid * avoid_e + w_mem_dyn * mem_e
+                       + W_WALL * wall_e + W_PATH_HIST * hist_e
+                       + W_ORIGIN_REPEL * orig_e)
 
         mag = math.hypot(blend_n, blend_e)
         if mag > 1e-3:
@@ -1188,11 +1501,17 @@ class QualifierMission:
         if not (math.isfinite(blend_n) and math.isfinite(blend_e)):
             return 0.0, 0.0, 0.0, cur_yaw
 
-        # --- Speed scaling based on minimum clearance across all sectors ---
-        if min_clearance >= SAFE_DIST:
+        # --- Speed scaling: center sector clearance ---
+        # min(L,C,R) crawls the drone when flying along a corridor wall (L=0.6m kills speed
+        # even with C=3.0m). Use center clearance — only slow down if the path ahead is blocked.
+        # Apply a cap when BOTH sides are critical (< CRIT_DIST) to prevent overshooting turns.
+        speed_clr = center_clearance
+        if left_clearance < CRIT_DIST and right_clearance < CRIT_DIST:
+            speed_clr = min(speed_clr, SAFE_DIST * 0.8)   # both walls close — cap at ~80% SAFE
+        if speed_clr >= SAFE_DIST:
             speed = VEL_MAX
-        elif min_clearance > CRIT_DIST:
-            t = (min_clearance - CRIT_DIST) / (SAFE_DIST - CRIT_DIST)
+        elif speed_clr > CRIT_DIST:
+            t = (speed_clr - CRIT_DIST) / (SAFE_DIST - CRIT_DIST)
             speed = VEL_MIN + t * (VEL_MAX - VEL_MIN)
         else:
             speed = VEL_MIN
@@ -1208,6 +1527,9 @@ class QualifierMission:
 
         vn = speed * blend_n
         ve = speed * blend_e
+        # Store for NAV status log
+        self._last_vn = vn
+        self._last_ve = ve
 
         # --- Altitude P-controller ---
         # NED: down < 0 when above ground; positive vd moves toward ground
@@ -1222,17 +1544,18 @@ class QualifierMission:
         if not math.isfinite(desired_yaw):
             desired_yaw = cur_yaw
 
-        side_tilt_max = 30.0
-        # Only tilt when one side is meaningfully tighter than center and SAFE_DIST
+        side_tilt_max = 35.0
+        # Yaw tilts toward tighter side starting at SOFT_DIST — gives depth camera
+        # earlier visibility of side obstacles (was SAFE_DIST, which was too late).
         if (left_clearance < right_clearance
                 and left_clearance < center_clearance
-                and left_clearance < SAFE_DIST):
-            bias = side_tilt_max * (1.0 - left_clearance / SAFE_DIST)
+                and left_clearance < SOFT_DIST):
+            bias = side_tilt_max * (1.0 - left_clearance / SOFT_DIST)
             desired_yaw -= bias   # yaw left in NED clockwise convention
         elif (right_clearance < left_clearance
                 and right_clearance < center_clearance
-                and right_clearance < SAFE_DIST):
-            bias = side_tilt_max * (1.0 - right_clearance / SAFE_DIST)
+                and right_clearance < SOFT_DIST):
+            bias = side_tilt_max * (1.0 - right_clearance / SOFT_DIST)
             desired_yaw += bias   # yaw right
 
         yaw_error = ((desired_yaw - cur_yaw + 180.0) % 360.0) - 180.0
@@ -1348,8 +1671,16 @@ class QualifierMission:
         wp = self._current_wp()
         if wp is None:
             if self._phase == "YELLOW":
-                print(f"\n[PHASE 1 DONE] {self.tracker.summary()}")
-                if self._time_left() > 90:
+                print(f"\n[PHASE 1 DONE] T={self._elapsed():.0f}s  {self.tracker.summary()}  "
+                      f"{self._coverage_summary()}")
+                if self._time_left() > 120:
+                    # Climb to RED altitude + scan before entering Zone 2/3 blind.
+                    # Phase 1 map has only Zone 1 data — without this scan the drone
+                    # flies into Zone 2/3 with zero obstacle awareness and crashes.
+                    await self._phase_transition_scan(ALT_RED)
+                    await self._start_phase("RED")
+                elif self._time_left() > 60:
+                    print("[MISSION] Not enough time for full red sweep — skipping pre-scan.")
                     await self._start_phase("RED")
                 else:
                     print("[MISSION] Not enough time for red sweep.")
@@ -1365,6 +1696,55 @@ class QualifierMission:
         cur_n = pose["north"]
         cur_e = pose["east"]
 
+        # EKF jump guard: if position teleports >5m in one control tick (impossible
+        # at VEL_MAX=1.0 m/s, which gives 0.07m/tick), EKF is corrupted — hover.
+        _last_n = getattr(self, '_last_ekf_n', None)
+        _last_e = getattr(self, '_last_ekf_e', None)
+        if _last_n is not None:
+            _jump = math.hypot(cur_n - _last_n, cur_e - _last_e)
+            if _jump > 5.0:
+                print(f"[EKF] T={self._elapsed():.0f}s  Position jump {_jump:.1f}m detected "
+                      f"({_last_n:.1f},{_last_e:.1f})→({cur_n:.1f},{cur_e:.1f}) — "
+                      f"hovering 3s for EKF to settle")
+                for _ in range(45):
+                    p_hov = self._pose()
+                    if p_hov and self.state.is_in_offboard:
+                        await self.drone.send_velocity(0.0, 0.0, 0.0, p_hov["yaw_deg"])
+                    await asyncio.sleep(0.1)
+                self._reset_stuck()
+                self._last_ekf_n = None   # clear so next tick gets a fresh baseline
+                return
+        self._last_ekf_n = cur_n
+        self._last_ekf_e = cur_e
+
+        # EKF altitude corruption guard: if reported altitude is implausible
+        # (>target+8m or below ground), altitude controller commands max vz,
+        # causing a crash dive. Zero vz and wait for EKF to settle instead.
+        _alt_m = -pose["down"]
+        _target_alt = ALT_RED if self._phase == "RED" else ALT_YELLOW
+        if _alt_m > _target_alt + 8.0 or _alt_m < -0.5:
+            # Irrecoverable: altitude so extreme EKF will never self-correct.
+            # Hovering just wastes the remaining mission time. End immediately.
+            if _alt_m < -50.0 or _alt_m > 200.0:
+                print(f"[EKF] FATAL T={self._elapsed():.0f}s  "
+                      f"Altitude {_alt_m:.1f}m — irrecoverable EKF corruption. "
+                      f"Ending mission immediately.")
+                self._state = MissionState.DONE
+                return
+            _now_a = time.monotonic()
+            if _now_a - getattr(self, '_ekf_alt_log_t', 0.0) >= 3.0:
+                print(f"[EKF] T={self._elapsed():.0f}s  Altitude {_alt_m:.1f}m implausible "
+                      f"(target={_target_alt}m) — hovering, waiting for EKF settle")
+                self._ekf_alt_log_t = _now_a
+            for _ in range(30):
+                p_hov = self._pose()
+                if p_hov and self.state.is_in_offboard:
+                    await self.drone.send_velocity(0.0, 0.0, 0.0, p_hov["yaw_deg"])
+                await asyncio.sleep(0.1)
+            self._reset_stuck()
+            self._last_ekf_n = None
+            return
+
         self._update_grid(pose)
 
         if self._arrived(wp):
@@ -1372,8 +1752,58 @@ class QualifierMission:
             self._advance_wp()
             return
 
+        approach_elapsed = time.monotonic() - self._wp_approach_start
+
+        # One-shot live obstacle check per WP — skips WPs inside pillar clusters
+        # discovered AFTER startup scan (filter_obstacle_wps only ran with 101 pts)
+        if not self._wp_dest_checked:
+            self._wp_dest_checked = True
+            obs_live = self.mapper.get_global_points()
+            if obs_live.shape[0] >= 5:
+                dists_live = np.linalg.norm(obs_live - np.array([[wp[0], wp[1]]]), axis=1)
+                if np.min(dists_live) < 3.5:
+                    print(f"[NAV] WP {self._wp_idx} dest blocked by live map "
+                          f"(min={np.min(dists_live):.1f}m) — skipping")
+                    self._advance_wp()
+                    return
+
+        if approach_elapsed > WP_APPROACH_TIMEOUT:
+            p_to = self._pose()
+            clr = getattr(self, '_last_min_clearance', 9.9)
+            obs_to = self.mapper.get_global_points()
+            obs_near_wp = (int(np.min(np.linalg.norm(obs_to - np.array([[wp[0], wp[1]]]), axis=1)))
+                           if obs_to.shape[0] > 0 else 999)
+            horiz_to = math.hypot(p_to["north"] - wp[0], p_to["east"] - wp[1]) if p_to else -1
+            print(f"[NAV] WP {self._wp_idx} approach timeout ({approach_elapsed:.0f}s) — "
+                  f"dist={horiz_to:.1f}m clr={clr:.1f}m obs_at_dest={obs_near_wp}m — skipping")
+            # Jump to nearest unvisited WP (by Euclidean distance) rather than next
+            # in list — prevents backtracking to the opposite side of the arena when
+            # the sequential boustrophedon wraps around after a skip.
+            jumped = False
+            if self._grid is not None and p_to is not None:
+                skip_to = self._nearest_unvisited_wp(p_to["north"], p_to["east"])
+                if skip_to is not None and skip_to > self._wp_idx:
+                    wp_check = self._waypoints[skip_to]
+                    skipped = skip_to - self._wp_idx - 1
+                    if skipped > 0:
+                        print(f"[NAV] Nearest unvisited → WP {skip_to}/{len(self._waypoints)} "
+                              f"N={wp_check[0]:.1f} E={wp_check[1]:.1f} "
+                              f"(skipped {skipped} farther WPs)")
+                    self._wp_idx = skip_to
+                    self._wp_approach_start = time.monotonic()
+                    self._wp_dest_checked = False
+                    self._reset_stuck()
+                    jumped = True
+            if not jumped:
+                self._advance_wp()
+            return
+
         if self._check_stuck():
-            print("[FSM] Stuck detected → EXPLORE → ESCAPE")
+            p_stk = self._pose()
+            pos_stk = f"({p_stk['north']:.1f},{p_stk['east']:.1f})" if p_stk else "?"
+            print(f"[FSM] T={self._elapsed():.0f}s  Stuck at {pos_stk} "
+                  f"WP {self._wp_idx}→N={wp[0]:.1f} E={wp[1]:.1f} "
+                  f"clr={getattr(self,'_last_min_clearance',9.9):.1f}m → ESCAPE")
             self._state = MissionState.ESCAPE
             return
 
@@ -1398,12 +1828,107 @@ class QualifierMission:
             self.mapper.prune(cur_n, cur_e, MAP_RETENTION_M)
 
         # Detection every tick — no stop-and-scan required (Phase 3)
-        self._run_detection()
+        if DETECTION_ENABLED:
+            self._run_detection()
+
+        # Rate-limited NAV status log (every 10s) — verbose decision-making detail
+        _nav_now = time.monotonic()
+        if _nav_now - self._nav_log_time >= 10.0:
+            self._nav_log_time = _nav_now
+            horiz = math.hypot(pose["north"] - wp[0], pose["east"] - wp[1])
+            obs_near = self.mapper.get_global_points()
+            obs_count_5m = (
+                int(np.sum(np.linalg.norm(
+                    obs_near - np.array([[cur_n, cur_e]]), axis=1) < 5.0))
+                if obs_near.shape[0] > 0 else 0
+            )
+            spd = math.hypot(getattr(self, '_last_vn', 0.0), getattr(self, '_last_ve', 0.0))
+            hdg_deg = math.degrees(math.atan2(
+                getattr(self, '_last_ve', 0.0), getattr(self, '_last_vn', 0.0)))
+            cam_clr = getattr(self, '_last_min_clearance', 9.9)
+            map_clr = getattr(self, '_last_map_clearance', 9.9)
+            eff_clr = min(cam_clr, map_clr)
+            if eff_clr < CRIT_DIST:
+                status = "AVOID-CRIT"
+            elif eff_clr < SAFE_DIST:
+                status = "AVOID-SLOW"
+            else:
+                status = "CLEAR"
+            # Cardinal labels for depth sectors and movement heading
+            facing = self._yaw_to_cardinal(pose["yaw_deg"])
+            fwd_c, left_c, right_c = self._sector_cardinals(pose["yaw_deg"])
+            hdg_card = self._yaw_to_cardinal(hdg_deg)
+            goal_card = self._yaw_to_cardinal(math.degrees(math.atan2(
+                wp[1] - cur_e, wp[0] - cur_n)))
+            # Why drone may not be going straight toward WP
+            if status == "AVOID-CRIT":
+                decision = f"BLOCKED — all sectors <{CRIT_DIST}m, using escape direction"
+            elif status == "AVOID-SLOW":
+                decision = f"SLOWING — cam {cam_clr:.1f}m <{SAFE_DIST}m, blending avoidance"
+            else:
+                decision = f"FREE — driving toward WP ({goal_card}) at {spd:.2f}m/s"
+            print(f"\n[NAV] T={self._elapsed():.0f}s  [{status}]  phase={self._phase}  "
+                  f"pos=({cur_n:.1f},{cur_e:.1f}) alt={-pose['down']:.1f}m  "
+                  f"facing={facing} moving={hdg_card}\n"
+                  f"      WP {self._wp_idx}/{len(self._waypoints)} "
+                  f"→ N={wp[0]:.1f} E={wp[1]:.1f} ({goal_card})  dist={horiz:.1f}m  "
+                  f"t_wp={approach_elapsed:.0f}s\n"
+                  f"      cam: {left_c}={cam_clr:.1f}m(L)  {fwd_c}={cam_clr:.1f}m(C)  "
+                  f"{right_c}={cam_clr:.1f}m(R)  map_clr={map_clr:.1f}m  "
+                  f"alt_bonus=+{self._alt_bonus_m:.1f}m\n"
+                  f"      Decision: {decision}  obs5m={obs_count_5m}  "
+                  f"map={obs_near.shape[0]}pts")
+
+        # Record path history every PATH_HIST_INTERVAL ticks for backtrack repulsion
+        self._path_hist_tick += 1
+        if self._path_hist_tick % PATH_HIST_INTERVAL == 0:
+            self._path_history.append((cur_n, cur_e))
+            if len(self._path_history) > PATH_HIST_LEN:
+                self._path_history.pop(0)
+
+        # Altitude override: when stuck in AVOID-CRIT >10s, climb 0.5m steps
+        # up to ALT_MAX_EXPLORE. Lets drone find routes above obstacles.
+        eff_clr_now = min(getattr(self, '_last_min_clearance', 9.9),
+                          getattr(self, '_last_map_clearance', 9.9))
+        phase_base_alt = ALT_RED if self._phase == "RED" else ALT_YELLOW
+        if eff_clr_now < CRIT_DIST:
+            if self._crit_alt_start is None:
+                self._crit_alt_start = time.monotonic()
+            elif time.monotonic() - self._crit_alt_start > 10.0:
+                new_bonus = min(ALT_MAX_EXPLORE - phase_base_alt,
+                                self._alt_bonus_m + 0.5)
+                if new_bonus > self._alt_bonus_m + 0.01:
+                    self._alt_bonus_m = new_bonus
+                    print(f"[ALT] T={self._elapsed():.0f}s  "
+                          f"AVOID-CRIT >10s — climbing to "
+                          f"{phase_base_alt + self._alt_bonus_m:.1f}m "
+                          f"(+{self._alt_bonus_m:.1f}m bonus)")
+                self._crit_alt_start = time.monotonic()
+        else:
+            self._crit_alt_start = None
+            if self._alt_bonus_m > 0.01:
+                self._alt_bonus_m = max(0.0, self._alt_bonus_m - 0.05)
+
+        # Track consecutive blocked/avoid frames. After AVOID_STREAK_TRIGGER
+        # ticks (~2s) of being blocked, drone enters LOOK_AROUND to do a 360°
+        # depth scan — narrow camera FOV can't see lateral paths otherwise.
+        if eff_clr_now < SAFE_DIST:
+            self._avoid_streak += 1
+            if self._avoid_streak > AVOID_STREAK_TRIGGER:
+                print(f"[FSM] T={self._elapsed():.0f}s  AVOID streak "
+                      f"{self._avoid_streak} >{AVOID_STREAK_TRIGGER} "
+                      f"→ LOOK_AROUND")
+                self._avoid_streak = 0
+                self._state = MissionState.LOOK_AROUND
+                return
+        else:
+            self._avoid_streak = max(0, self._avoid_streak - 1)
 
         # Carrot point: target a point LOOKAHEAD_DIST ahead along path to WP.
         # Prevents lunging at distant WPs; makes movement smoother and more
         # reactive to local obstacles.
         carrot_n, carrot_e, carrot_d = self._carrot_point(pose, wp)
+        carrot_d -= self._alt_bonus_m   # NED: subtract = fly higher
 
         vn, ve, vd, yaw_deg = self._compute_velocity_setpoint(
             pose, carrot_n, carrot_e, carrot_d, depth
@@ -1440,7 +1965,8 @@ class QualifierMission:
             if depth_clean is not None:
                 self.mapper.update_frame(depth_clean, pose)
 
-            self._run_detection()
+            if DETECTION_ENABLED:
+                self._run_detection()
 
             await self.drone.send_position_setpoint(hold_n, hold_e, hold_d, target_yaw)
 
@@ -1461,6 +1987,128 @@ class QualifierMission:
         self._state = MissionState.EXPLORE
 
     # ------------------------------------------------------------------
+    # State tick: LOOK_AROUND
+    # ------------------------------------------------------------------
+    # Triggered when AVOID persists >2s. Depth camera FOV is ~60° — so when
+    # facing a pillar, all three L/C/R sectors see it and drone thinks every
+    # direction is blocked. Rotating in place to scan all 8 cardinal directions
+    # reveals open lateral paths that a single-frame view misses.
+    async def _tick_look_around(self):
+        p = self._pose()
+        if p is None:
+            self._state = MissionState.EXPLORE
+            return
+        hold_n, hold_e, hold_d = p["north"], p["east"], p["down"]
+        base_yaw = p["yaw_deg"]
+        print(f"[LOOK] T={self._elapsed():.0f}s  360° depth scan from "
+              f"({hold_n:.1f},{hold_e:.1f}) — narrow FOV → must look around")
+
+        best_yaw, best_clr = base_yaw, 0.0
+        scan_results = []
+        for delta in range(0, 360, 45):
+            yaw = (base_yaw + delta) % 360.0
+            try:
+                await self.drone.rotate_to_yaw(yaw)
+            except Exception:
+                pass
+            # Hold position + settle
+            for _ in range(6):
+                pp = self._pose()
+                if pp and self.state.is_in_offboard:
+                    await self.drone.send_position_setpoint(hold_n, hold_e, hold_d, yaw)
+                await asyncio.sleep(0.06)
+
+            # Sample depth several times, take max (most optimistic clearance)
+            clrs = []
+            for _ in range(3):
+                pp = self._pose()
+                depth = self._sanitize_depth(self.depth_rx.get_frame())
+                if depth is not None and pp is not None:
+                    try:
+                        _, _, _, info = self.planner.compute_position_ned(
+                            depth, pp, step_size=1.0)
+                        clrs.append(info["clearance"]["center"])
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.05)
+            clr = max(clrs) if clrs else 0.0
+            card = self._yaw_to_cardinal(yaw)
+            scan_results.append((yaw, card, clr))
+            print(f"[LOOK]   yaw={yaw:5.0f}° ({card:>2})  cam_clr={clr:.1f}m")
+            if clr > best_clr:
+                best_clr = clr
+                best_yaw = yaw
+
+        best_card = self._yaw_to_cardinal(best_yaw)
+        print(f"[LOOK] BEST: {best_card} ({best_yaw:.0f}°)  cam_clr={best_clr:.1f}m")
+
+        if best_clr < 1.5:
+            # No open direction — escalate to ESCAPE
+            print("[LOOK] No clear direction — falling back to ESCAPE")
+            self._state = MissionState.ESCAPE
+            return
+
+        # Commit a short burst in the best direction. Reject directions
+        # heading toward origin if drone is already >4m from spawn.
+        burst_dist = min(best_clr - 0.5, LOOK_BURST_M)
+        target_n = hold_n + burst_dist * math.cos(math.radians(best_yaw))
+        target_e = hold_e + burst_dist * math.sin(math.radians(best_yaw))
+        d_from_origin_now = math.hypot(hold_n - self._origin_n, hold_e - self._origin_e)
+        d_from_origin_new = math.hypot(target_n - self._origin_n, target_e - self._origin_e)
+        if d_from_origin_now > 4.0 and d_from_origin_new < d_from_origin_now - 0.5:
+            # Burst heads back toward origin — pick next-best direction instead
+            scan_results.sort(key=lambda s: -s[2])
+            for yaw_c, card_c, clr_c in scan_results[1:]:
+                if clr_c < 1.5:
+                    break
+                tn = hold_n + min(clr_c - 0.5, LOOK_BURST_M) * math.cos(math.radians(yaw_c))
+                te = hold_e + min(clr_c - 0.5, LOOK_BURST_M) * math.sin(math.radians(yaw_c))
+                d_new = math.hypot(tn - self._origin_n, te - self._origin_e)
+                if d_new >= d_from_origin_now - 0.5:
+                    print(f"[LOOK] BEST→origin; switching to {card_c} ({yaw_c:.0f}°) "
+                          f"cam_clr={clr_c:.1f}m")
+                    best_yaw, best_card, best_clr = yaw_c, card_c, clr_c
+                    burst_dist = min(best_clr - 0.5, LOOK_BURST_M)
+                    target_n, target_e = tn, te
+                    break
+
+        print(f"[LOOK] Commit burst {burst_dist:.1f}m {best_card} "
+              f"→ ({target_n:.1f},{target_e:.1f})")
+        try:
+            await self.drone.rotate_to_yaw(best_yaw)
+        except Exception:
+            pass
+        # Send position setpoint and wait for arrival (or 5s timeout)
+        t_burst_start = time.monotonic()
+        while time.monotonic() - t_burst_start < 5.0:
+            pp = self._pose()
+            if pp is None:
+                break
+            d_remain = math.hypot(pp["north"] - target_n, pp["east"] - target_e)
+            if d_remain < 0.6:
+                break
+            if self.state.is_in_offboard:
+                await self.drone.send_position_setpoint(target_n, target_e, hold_d, best_yaw)
+            await asyncio.sleep(0.1)
+        self._last_escape_time = time.monotonic()
+
+        # After burst — skip to nearest unvisited WP so drone resumes coverage
+        p2 = self._pose()
+        if p2 is not None and self._grid is not None:
+            skip_to = self._nearest_unvisited_wp(p2["north"], p2["east"])
+            if skip_to is not None:
+                self._wp_idx = skip_to
+                nwp = self._current_wp()
+                if nwp:
+                    print(f"[LOOK] → nearest unvisited WP {self._wp_idx} "
+                          f"N={nwp[0]:.1f} E={nwp[1]:.1f}")
+
+        self._avoid_streak = 0
+        self._reset_stuck()
+        print("[FSM] LOOK_AROUND → EXPLORE")
+        self._state = MissionState.EXPLORE
+
+    # ------------------------------------------------------------------
     # State tick: ESCAPE
     # ------------------------------------------------------------------
     async def _tick_escape(self):
@@ -1473,7 +2121,10 @@ class QualifierMission:
         self._consecutive_stuck += 1
         tier = self._consecutive_stuck
         wp = self._current_wp()
-        print(f"[ESCAPE] Tier {tier} (consecutive stucks at this leg)")
+        p_esc = self._pose()
+        pos_esc = f"({p_esc['north']:.1f},{p_esc['east']:.1f})" if p_esc else "?"
+        print(f"[ESCAPE] T={self._elapsed():.0f}s  Tier {tier} at {pos_esc} "
+              f"WP={self._wp_idx} clr={getattr(self,'_last_min_clearance',9.9):.1f}m")
 
         if tier == 1:
             # Reactive escape — random non-wall direction
@@ -1484,7 +2135,17 @@ class QualifierMission:
                     p["north"], p["east"], p["down"], p["yaw_deg"]
                 )
             await asyncio.sleep(2.0)
-            if self._wp_idx < len(self._waypoints) - 1:
+            # Skip to nearest unvisited WP — avoids retrying same blocked direction
+            p = self._pose()
+            skip_to = (self._nearest_unvisited_wp(p["north"], p["east"])
+                       if (p is not None and self._grid is not None) else None)
+            if skip_to is not None:
+                self._wp_idx = skip_to
+                nwp = self._current_wp()
+                if nwp:
+                    print(f"[ESCAPE] T1 — skipping stuck WP → nearest unvisited WP {self._wp_idx}/"
+                          f"{len(self._waypoints)} N={nwp[0]:.1f} E={nwp[1]:.1f}")
+            elif self._wp_idx < len(self._waypoints) - 1:
                 self._wp_idx += 1
                 nwp = self._current_wp()
                 if nwp:
@@ -1544,12 +2205,18 @@ class QualifierMission:
             return
 
         # ── Stage 1: stop OFFBOARD so PX4 switches to HOLD/LAND ─────────
-        print("[RECOVERY] Stage 1 — stopping OFFBOARD")
-        try:
-            await self.drone.drone.offboard.stop()
-        except Exception as e:
-            print(f"[RECOVERY]   offboard.stop() failed (ignored): {e}")
-        await asyncio.sleep(1.0)
+        # Only call offboard.stop() when actually in OFFBOARD — calling it while
+        # already out of OFFBOARD causes PX4 to log "not-existing command 176" spam.
+        if self.state.is_in_offboard:
+            print("[RECOVERY] Stage 1 — stopping OFFBOARD")
+            try:
+                await self.drone.drone.offboard.stop()
+            except Exception as e:
+                print(f"[RECOVERY]   offboard.stop() failed (ignored): {e}")
+            await asyncio.sleep(1.0)
+        else:
+            print("[RECOVERY] Stage 1 — not in OFFBOARD, skipping stop")
+            await asyncio.sleep(0.3)
 
         # ── Stage 2: land if airborne ────────────────────────────────────
         p = self._pose()
@@ -1571,9 +2238,19 @@ class QualifierMission:
         else:
             print("[RECOVERY] Stage 2 — already on ground, skipping land")
 
-        # ── Stage 3: wait for disarm / PX4 settle ────────────────────────
+        # ── Stage 3: wait for disarm / PX4 settle + EKF altitude to stabilize ─
         print("[RECOVERY] Stage 3 — waiting for disarm / settle (3 s)")
         await asyncio.sleep(3.0)
+        # Wait for EKF altitude to report near ground level.
+        # A corrupted EKF (e.g. alt=-1.16m = underground) will cause OFFBOARD
+        # to be rejected by PX4 even after successful re-arm.
+        for _ in range(90):   # up to 45 s — SITL EKF needs longer after hard crash
+            p = self._pose()
+            if p is not None and -0.5 <= p["down"] <= 1.5:
+                break
+            await asyncio.sleep(0.5)
+        else:
+            print("[RECOVERY] EKF altitude unstable after 45s — proceeding anyway (may abort)")
 
         # ── Stage 4: re-arm and take off ─────────────────────────────────
         print("[RECOVERY] Stage 4 — re-arm and takeoff")
@@ -1590,11 +2267,41 @@ class QualifierMission:
                 break
             await asyncio.sleep(0.1)
 
-        # Reset stuck detection from new position; stay in current phase/waypoint
+        # Clear stale obstacle map — EKF position shifted during crash so old obstacle
+        # points are in the wrong reference frame and produce bad repulsion vectors.
+        print("[RECOVERY] Clearing stale obstacle map")
+        self.mapper.clear()
+
+        # Reset stuck / flip state from new position
         self._reset_stuck()
         self._flip_count = 0
         self._was_in_offboard = False   # will flip back True once telemetry confirms OFFBOARD
-        print(f"[RECOVERY] Airborne again — resuming phase={self._phase} WP={self._wp_idx}")
+
+        # EKF XY stability check — verify position is not still jumping before we scan.
+        # If two consecutive readings differ by >3m the EKF is still corrupted; wait up to 20s.
+        _prev_rn: float | None = None
+        _prev_re: float | None = None
+        for _ in range(40):
+            p = self._pose()
+            if p is not None:
+                rn, re = p["north"], p["east"]
+                if _prev_rn is not None:
+                    jump = math.hypot(rn - _prev_rn, re - _prev_re)
+                    if jump < 3.0:
+                        break
+                    print(f"[RECOVERY] EKF XY still unstable (jump={jump:.1f}m) — waiting…")
+                _prev_rn, _prev_re = rn, re
+            await asyncio.sleep(0.5)
+        else:
+            print("[RECOVERY] EKF XY did not stabilise in 20s — proceeding anyway")
+
+        # Rebuild obstacle awareness with a fresh 360° scan from new position,
+        # then regenerate waypoints so drone starts from a valid local context
+        # instead of resuming a potentially unreachable Zone 2/3 WP.
+        print(f"[RECOVERY] Rebuilding map + restarting phase={self._phase} from new position")
+        await self._startup_scan()
+        await self._start_phase(self._phase)
+        print(f"[RECOVERY] Phase restarted — WP 0/{len(self._waypoints)}")
 
     # ------------------------------------------------------------------
     # Dispatch-table control loop
@@ -1603,8 +2310,9 @@ class QualifierMission:
         dt = 1.0 / CONTROL_HZ
 
         _dispatch = {
-            MissionState.EXPLORE: self._tick_explore,
-            MissionState.ESCAPE:  self._tick_escape,
+            MissionState.EXPLORE:     self._tick_explore,
+            MissionState.ESCAPE:      self._tick_escape,
+            MissionState.LOOK_AROUND: self._tick_look_around,
         }
 
         print(f"[FSM] Control loop started — state: {self._state.value}")
@@ -1623,7 +2331,8 @@ class QualifierMission:
                     and not self.state.is_armed
                     and self._state in (MissionState.EXPLORE,
                                         MissionState.SCAN,
-                                        MissionState.ESCAPE)):
+                                        MissionState.ESCAPE,
+                                        MissionState.LOOK_AROUND)):
                 await self._attempt_restart()
                 continue
 
@@ -1646,8 +2355,17 @@ class QualifierMission:
                         print("[RECOVERY] Max restarts reached — ending mission")
                         self._state = MissionState.DONE
                     continue
-                # Don't send position setpoints to a potentially crashed drone — just wait
-                await asyncio.sleep(0.5)
+                # Send velocity=0 — minimal input, no dependence on EKF altitude accuracy.
+                # Position setpoints with corrupted EKF altitude (e.g. EKF says 12m when
+                # drone is at 1.8m) cause violent descent commands and worsen the crash.
+                p_flip = self._pose()
+                if p_flip is not None and self.state.is_in_offboard:
+                    try:
+                        await self.drone.send_velocity(0.0, 0.0, 0.0, p_flip["yaw_deg"])
+                    except Exception:
+                        await asyncio.sleep(0.1)
+                else:
+                    await asyncio.sleep(0.5)
                 continue
 
             # Flip just cleared — two-tier recovery
@@ -1682,26 +2400,30 @@ class QualifierMission:
                         self._state = MissionState.DONE
                     continue
                 else:
-                    # Soft recovery: hold position 3 s to let drone stabilise.
-                    # Use WP target altitude — p["down"] may be wrong after
-                    # a flip-induced EKF home reference jump (seen as -459m / 15m boomerang).
-                    wp_now = self._current_wp()
-                    hold_d = wp_now[2] if wp_now else -ALT_YELLOW
+                    # Soft recovery: hold current EKF position for 3s via velocity=0.
+                    # Using WP target altitude (e.g. -1.8m) when EKF reports 12m causes
+                    # the position controller to command a violent 10m descent → second crash.
+                    # velocity=0 means "stop moving" regardless of EKF accuracy.
                     print(
                         f"[RECOVERY] Soft recovery flip #{self._flip_count} "
-                        f"(alt={alt_m:.1f}m hold_d={hold_d:.2f}) — holding 3s then resuming"
+                        f"(alt={alt_m:.1f}m) — velocity=0 hold 3s then resuming"
                     )
-                    await self.drone.send_position_setpoint(
-                        p["north"], p["east"], hold_d, p["yaw_deg"]
-                    )
-                    await asyncio.sleep(3.0)
+                    for _ in range(30):   # 3 s at ~10 Hz
+                        p_now = self._pose()
+                        yaw_now = p_now["yaw_deg"] if p_now else 0.0
+                        try:
+                            await self.drone.send_velocity(0.0, 0.0, 0.0, yaw_now)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.1)
 
             # OFFBOARD persistence watchdog (Phase B):
             # If PX4 drops OFFBOARD mid-mission while armed and airborne, attempt
             # automatic re-entry (no full re-arm). Up to 3 attempts.
             # If grounded/disarmed, fall through to crash detection above.
             if (not self.state.is_in_offboard
-                    and self._state in (MissionState.EXPLORE, MissionState.ESCAPE)):
+                    and self._state in (MissionState.EXPLORE, MissionState.ESCAPE,
+                                        MissionState.LOOK_AROUND)):
                 _now = time.monotonic()
                 if self._offboard_lost_since == 0.0:
                     self._offboard_lost_since = _now
@@ -1929,12 +2651,19 @@ class QualifierMission:
 
 
 async def main():
+    import os
     model_path = sys.argv[1] if len(sys.argv) > 1 else ""
+    if not model_path:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        for candidate in ("yolov10n.pt", "yolov8n.pt", "barrels.pt"):
+            p = os.path.join(script_dir, candidate)
+            if os.path.isfile(p):
+                model_path = p
+                break
     if model_path:
         print(f"[CONFIG] YOLO model: {model_path}")
     else:
-        print("[CONFIG] No model — using HSV colour detection")
-        print("[INFO]   Tip: python3 qualifier_main.py barrels.pt  to enable YOLO\n")
+        print("[CONFIG] No YOLO model found — using HSV colour detection only")
 
     mission = QualifierMission(model_path)
     try:
