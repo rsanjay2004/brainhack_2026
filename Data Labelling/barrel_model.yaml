@@ -1,0 +1,12 @@
+type: yolov8
+name: barrel-detector-r20260521
+display_name: Barrel Detector
+model_path: best.onnx
+confidence_threshold: 0.35
+input_height: 640
+input_width: 640
+nms_threshold: 0.45
+score_threshold: 0.35
+classes:
+  - red barrel
+  - yellow barrel
