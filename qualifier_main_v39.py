@@ -48,6 +48,7 @@ import json
 import math
 import os
 import shutil
+import sys
 import time
 import zipfile
 from dataclasses import dataclass, field
@@ -71,7 +72,7 @@ except Exception as _avoid_import_exc:
     print(f"[WARN] Could not import AvoidancePlanner.py: {_avoid_import_exc}")
 
 
-DEFAULT_RGB_TOPIC = "/world/roboverse/model/x500_depth_0/link/camera_link/sensor/IMX214/image"
+DEFAULT_RGB_TOPIC = "/world/roboverse/model/x500_vision_0/link/camera_link/sensor/IMX214/image"
 DEFAULT_DEPTH_TOPIC = "/depth_camera"
 
 K_DEFAULT = np.array(
@@ -132,6 +133,29 @@ def safe_percentile(region: np.ndarray, percentile: float, fallback: float) -> f
 
 def clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
+
+
+class _Tee:
+    """Duplicate a text stream to several sinks (console + log file)."""
+
+    def __init__(self, *streams: Any) -> None:
+        self._streams = streams
+
+    def write(self, data: str) -> int:
+        for s in self._streams:
+            try:
+                s.write(data)
+                s.flush()
+            except Exception:
+                pass
+        return len(data)
+
+    def flush(self) -> None:
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
 
 
 # -----------------------------------------------------------------------------
@@ -518,6 +542,28 @@ class OccupancyGridMapper:
                     if di * di + dj * dj <= radius_cells * radius_cells:
                         blocked.add((ci + di, cj + dj))
         return blocked
+
+    def clearance_along(self, start_ne: Tuple[float, float], yaw_deg: float, max_m: float, step_m: Optional[float] = None) -> float:
+        """Raycast the occupancy grid from start_ne along yaw_deg.
+
+        Returns metres to the first inflated/occupied cell, or max_m if none.
+        Used for fast, rotation-free heading evaluation: the map already holds
+        the obstacles, so candidate headings are scored without physically
+        yawing the drone to take a depth snapshot.
+        """
+        step = float(step_m) if step_m else max(0.15, 0.5 * self.res)
+        yaw = math.radians(float(yaw_deg))
+        c = math.cos(yaw)
+        s = math.sin(yaw)
+        n0, e0 = start_ne
+        blocked = self.inflated_occupied()
+        r = step
+        while r <= max_m:
+            cell = self.world_to_cell(n0 + r * c, e0 + r * s)
+            if cell in blocked or self.is_occupied(cell):
+                return r
+            r += step
+        return max_m
 
     def known_free_cells(self) -> List[Cell]:
         return [c for c, v in self.logodds.items() if v <= -1]
@@ -2166,6 +2212,9 @@ class QualifierMission:
 
         self.current_path: List[Tuple[float, float]] = []
         self.last_plan_ms = 0
+        # v39 path commitment: pose at which the live global path was planned.
+        # Distance from here is the edge weight that gates the next replan.
+        self.last_plan_ne: Optional[Tuple[float, float]] = None
         self.last_photo_ms = 0
         self.last_detection_ms = 0
         self.last_saved_pose: Optional[Dict[str, float]] = None
@@ -2189,6 +2238,18 @@ class QualifierMission:
         self.local_corridor_until_ms = 0
         self.local_soft_block_count = 0
         self.local_corridor_candidates: List[Dict[str, float]] = []
+
+        # v39 branch commitment + hysteresis state.  Prevents the side-opening
+        # selector from re-picking a different heading every control tick (the
+        # oscillation that pins the drone near the origin).  Treats each branch
+        # commit as a graph node and the distance travelled since it as the
+        # edge weight: a new branch is only allowed once that edge weight clears
+        # a lower bound (no oscillation) and the commit window has not yet hit
+        # its upper bound (no overcommit / flying past doorways).
+        self.last_branch_commit_ms = 0
+        self.last_branch_commit_ne: Optional[Tuple[float, float]] = None
+        self.last_branch_score = 0.0
+        self.last_branch_yaw: Optional[float] = None
 
         # v29 express corridor mode.  When the depth camera sees a straight path
         # with a left and right boundary, stop treating the route as many tiny A*
@@ -2371,16 +2432,26 @@ class QualifierMission:
             headings = headings[:max_headings]
 
         candidates: List[Dict[str, float]] = []
-        print(f"[TOPO] {reason}; scanning {len(headings)} gateway headings from yaw={base:.0f}")
+        fast_grid = bool(getattr(self.args, "fast_grid_decision", True))
+        start_ne = (float(pose["north"]), float(pose["east"]))
+        mode_label = "grid-eval" if fast_grid else "yaw-scan"
+        print(f"[TOPO] {reason}; {mode_label} {len(headings)} gateway headings from yaw={base:.0f}")
         for y in headings:
-            p_snap, d_snap = await self.mapping_yaw_snapshot(
-                y,
-                timeout_s=float(getattr(self.args, "topo_scan_yaw_timeout_s", self.args.recovery_yaw_timeout_s)),
-                tolerance_deg=float(getattr(self.args, "topo_scan_yaw_tolerance_deg", self.args.recovery_yaw_tolerance_deg)),
-            )
-            if p_snap is not None:
-                self.mapper.update_from_depth(d_snap, p_snap)
-            left, center, right = self.clearances(d_snap)
+            if fast_grid:
+                # Rotation-free heading evaluation straight from the occupancy grid.
+                # The map is already built, so no need to physically yaw + depth-snapshot.
+                center = self.mapper.clearance_along(start_ne, y, float(getattr(self.args, "topo_unknown_lookahead_m", 8.5)))
+                left = self.mapper.clearance_along(start_ne, wrap_deg(y + 90.0), 5.0)
+                right = self.mapper.clearance_along(start_ne, wrap_deg(y - 90.0), 5.0)
+            else:
+                p_snap, d_snap = await self.mapping_yaw_snapshot(
+                    y,
+                    timeout_s=float(getattr(self.args, "topo_scan_yaw_timeout_s", self.args.recovery_yaw_timeout_s)),
+                    tolerance_deg=float(getattr(self.args, "topo_scan_yaw_tolerance_deg", self.args.recovery_yaw_tolerance_deg)),
+                )
+                if p_snap is not None:
+                    self.mapper.update_from_depth(d_snap, p_snap)
+                left, center, right = self.clearances(d_snap)
             usable_dist = min(float(center), float(getattr(self.args, "topo_unknown_lookahead_m", 8.5)))
             unknown = self._unknown_gain_ahead(
                 pose,
@@ -2427,7 +2498,8 @@ class QualifierMission:
             candidates.append({"yaw": y, "left": left, "center": center, "right": right, "unknown": float(unknown), "visited": visited, "score": score, "viable": 1.0 if viable else 0.0, "key": key})
             print(f"[TOPO] yaw={y:.0f} L={left:.2f} C={center:.2f} R={right:.2f} unknown={unknown} visited={visited:.1f} attempts={attempts} recent={recent_block} viable={viable} score={score:.2f}")
             self.record_gateway_event("scan_candidate", pose, y, unknown, (left, center, right), score, key)
-            await self.maybe_save_or_detect(note="topo_gateway_scan")
+            if not fast_grid:
+                await self.maybe_save_or_detect(note="topo_gateway_scan")
 
         viable_candidates = [c for c in candidates if c["viable"] > 0.5]
         if not viable_candidates:
@@ -2474,11 +2546,27 @@ class QualifierMission:
         self.rejected_frontiers = {c: expiry for c, expiry in self.rejected_frontiers.items() if expiry > t}
         return set(self.rejected_frontiers.keys())
 
-    def reject_frontier_world(self, target_ne: Tuple[float, float], reason: str) -> None:
-        cell = self.mapper.world_to_cell(target_ne[0], target_ne[1])
+    def reject_frontier_world(self, target_ne: Tuple[float, float], reason: str, radius_m: float = 0.0) -> None:
+        c0 = self.mapper.world_to_cell(target_ne[0], target_ne[1])
         ttl_ms = int(float(self.args.reject_frontier_ttl_s) * 1000)
-        self.rejected_frontiers[cell] = now_ms() + ttl_ms
-        print(f"[PLAN] temporarily rejected frontier cell={cell} reason={reason} ttl={self.args.reject_frontier_ttl_s:.0f}s")
+        expiry = now_ms() + ttl_ms
+        if radius_m <= 0.0:
+            self.rejected_frontiers[c0] = expiry
+            print(f"[PLAN] temporarily rejected frontier cell={c0} reason={reason} ttl={self.args.reject_frontier_ttl_s:.0f}s")
+            return
+        # Reject a small patch, not a single cell: when the drone is wedged the
+        # planner otherwise just re-picks an adjacent cell of the same
+        # unreachable frontier and loops.  A modest radius makes it commit to
+        # the next-best reachable frontier instead.
+        res = max(1e-3, float(getattr(self.mapper, "res", 0.2)))
+        cr = max(1, int(math.ceil(radius_m / res)))
+        n = 0
+        for dr in range(-cr, cr + 1):
+            for dc in range(-cr, cr + 1):
+                if dr * dr + dc * dc <= cr * cr:
+                    self.rejected_frontiers[(c0[0] + dr, c0[1] + dc)] = expiry
+                    n += 1
+        print(f"[PLAN] temporarily rejected frontier patch cell={c0} cells={n} r={radius_m:.1f}m reason={reason} ttl={self.args.reject_frontier_ttl_s:.0f}s")
 
     def record_waypoint(self, pose: Optional[Dict[str, float]], event: str, target_yaw: Optional[float] = None, clearances: Optional[Tuple[float, float, float]] = None, force: bool = False) -> None:
         """Record travelled waypoints / decision points for post-run review."""
@@ -2688,13 +2776,53 @@ class QualifierMission:
             return False
         self.last_dead_end_escape_ms = now
         self.dead_end_escape_count += 1
+
+        # v39: prefer routing to an unexplored frontier over a homeward
+        # breadcrumb retreat.  Backtracking only makes sense when the drone is
+        # genuinely sealed in.  If the global frontier planner can still reach
+        # unmapped space, take that path instead of turning back to the origin.
+        if bool(getattr(self.args, "dead_end_prefer_frontier", True)):
+            self.current_path = []
+            self.last_plan_ms = 0
+            self.replan(pose)
+            # Only skip the breadcrumb retreat if the planned path can actually
+            # be STARTED from here.  When the drone is wedged against a wall the
+            # first segment is blocked; "routing to the frontier" then just
+            # re-triggers the dead-end every tick and the drone freezes in
+            # place.  In that case fall through to a physical breadcrumb
+            # retreat, which backs the drone off the wall so a later plan is
+            # actually followable.
+            startable = bool(self.current_path) and self.mapper.path_segment_collision_free(
+                (pose["north"], pose["east"]),
+                self.current_path[0],
+                inflation_extra_m=self.args.path_extra_inflation_m,
+                ignore_start_m=0.0,
+            )
+            if startable:
+                self.backtrack_targets = []
+                self.local_corridor_yaw = None
+                self.stop_express_corridor(pose, reason="dead_end_frontier_replan")
+                goal = self.current_path[-1]
+                first = self.current_path[0]
+                face_yaw = yaw_from_vector_deg(first[0] - pose["north"], first[1] - pose["east"])
+                print(f"[DEAD_END] {reason}: unexplored frontier reachable (goal N={goal[0]:.1f} E={goal[1]:.1f}); turning to it and routing there")
+                # Decisively face the first waypoint.  Setting current_path and
+                # returning is not enough: the drone is still nose-to-obstacle,
+                # so the emergency front-block check fires again next tick and
+                # re-enters this handler -- the frontier path gets set every
+                # tick but never followed (the drone oscillates in place).
+                # Turning to the open first segment clears the front sector so
+                # the normal path-follower can actually drive the route.
+                await self.yaw_to_fast(face_yaw, timeout_s=2.5, tolerance_deg=15.0)
+                return True
+
         targets = self.choose_backtrack_targets(pose)
         self.current_path = []
         self.local_corridor_yaw = None
         self.stop_express_corridor(pose, reason="dead_end_escape")
         if targets:
             self.backtrack_targets = targets
-            self.backtrack_until_ms = now + int(float(getattr(self.args, "dead_end_backtrack_timeout_s", 10.0)) * 1000)
+            self.backtrack_until_ms = now + int(float(getattr(self.args, "dead_end_backtrack_timeout_s", 6.0)) * 1000)
             first = targets[0]
             yaw = yaw_from_vector_deg(first[0] - pose["north"], first[1] - pose["east"])
             print(f"[DEAD_END] {reason}: breadcrumb backtrack targets={len(targets)} first=N{first[0]:.1f},E{first[1]:.1f}, yaw={yaw:.0f}")
@@ -2875,6 +3003,51 @@ class QualifierMission:
         score, label, yaw, clear, unknown, visited, key = best
         if unknown < int(getattr(self.args, "side_opening_min_unknown_cells", 18)):
             return False
+
+        # --- branch commitment + hysteresis -----------------------------------
+        # Node = a branch commit; edge weight = distance travelled since it.
+        # Lower bound: while still inside the commit window, do not switch to a
+        # different heading until the drone has actually travelled a minimum
+        # distance (or a minimum time has passed) -- this kills the per-tick
+        # re-pick oscillation.  Upper bound: once side_opening_commit_s expires
+        # the commit window closes and branching is free again, so the drone
+        # cannot overcommit and sail past a doorway.
+        now = now_ms()
+        committed = (
+            self.local_corridor_yaw is not None
+            and now < self.local_corridor_until_ms
+            and self.last_branch_commit_ne is not None
+        )
+        if committed:
+            travelled = math.hypot(
+                pose["north"] - self.last_branch_commit_ne[0],
+                pose["east"] - self.last_branch_commit_ne[1],
+            )
+            elapsed_ms = now - self.last_branch_commit_ms
+            realign_deg = float(getattr(self.args, "branch_realign_deg", 35.0))
+            same_heading = (
+                self.last_branch_yaw is not None
+                and abs(yaw_error_deg(yaw, self.last_branch_yaw)) <= realign_deg
+            )
+            if not same_heading:
+                min_travel = float(getattr(self.args, "branch_min_travel_m", 1.5))
+                min_interval_ms = int(float(getattr(self.args, "branch_min_interval_s", 3.0)) * 1000)
+                # Lower bound on edge weight: too soon AND too little travel -> hold.
+                if travelled < min_travel and elapsed_ms < min_interval_ms:
+                    print(
+                        f"[GATEWAY] branch hold: committed yaw={self.last_branch_yaw:.0f} "
+                        f"travelled={travelled:.2f}m elapsed={elapsed_ms/1000:.1f}s "
+                        f"(candidate yaw={yaw:.0f} score={score:.1f} suppressed)"
+                    )
+                    return False
+                # Hysteresis: a different heading must clearly beat the committed one.
+                margin = float(getattr(self.args, "branch_switch_margin", 1.25))
+                if score <= self.last_branch_score * margin:
+                    print(
+                        f"[GATEWAY] branch hold: candidate yaw={yaw:.0f} score={score:.1f} "
+                        f"does not beat committed score={self.last_branch_score:.1f} x{margin:.2f}"
+                    )
+                    return False
         if key is not None:
             self.gateway_attempts[key] = self.gateway_attempts.get(key, 0) + 1
             self.last_gateway_selected_key = key
@@ -2883,6 +3056,12 @@ class QualifierMission:
         self.current_path = []
         self.local_corridor_yaw = yaw
         self.local_corridor_until_ms = now_ms() + int(float(getattr(self.args, "side_opening_commit_s", 14.0)) * 1000)
+        # Record this commit as a node: heading, score and the pose it was taken
+        # from, so the next candidate is judged against the edge weight since.
+        self.last_branch_commit_ms = now_ms()
+        self.last_branch_commit_ne = (pose["north"], pose["east"])
+        self.last_branch_score = score
+        self.last_branch_yaw = yaw
         print(f"[GATEWAY] side opening {label} selected yaw={yaw:.0f} clear={clear:.1f} unknown={unknown} visited={visited:.1f} score={score:.1f}")
         self.record_waypoint(pose, event=f"gateway_side_opening:{label}:{reason}", target_yaw=yaw, clearances=(left, center, right), force=True)
         await self.yaw_to_fast(yaw, timeout_s=float(getattr(self.args, "side_opening_yaw_timeout_s", 1.0)), tolerance_deg=float(getattr(self.args, "side_opening_yaw_tolerance_deg", 28.0)))
@@ -3080,11 +3259,14 @@ class QualifierMission:
                 await self.stop_motion(0.05)
             return True
 
-        if safe_speed < float(getattr(self.args, "min_progress_speed_m_s", 0.06)):
+        if safe_speed < float(getattr(self.args, "min_progress_speed_m_s", 0.06)) or self._progress_choked(desired_vn, desired_ve, safe_vn, safe_ve):
             self.express_corridor_block_count += 1
             if self.express_corridor_block_count >= int(getattr(self.args, "express_corridor_block_limit", 2)):
-                self.stop_express_corridor(pose, "no_progress")
-                await self.scan_viable_pathways(reason="express_no_progress")
+                print(f"[EXPRESS] forward progress choked by obstacle (safe={safe_speed:.2f}); abandoning corridor and replanning")
+                self.express_corridor_block_count = 0
+                self.stop_express_corridor(pose, "obstacle_choked")
+                self.current_path = []
+                await self.scan_viable_pathways(reason="express_obstacle_choked")
             else:
                 await self.stop_motion(0.05)
             return True
@@ -3251,9 +3433,18 @@ class QualifierMission:
         # then +/-45) and commit to a fresh branch if one is visible.
         yaw = await self.scan_viable_pathways(reason="front_block_bypass")
         if yaw is not None:
+            print(f"[FRONT_BLOCK] side/branch bypass selected yaw={yaw:.0f}; not backtracking")
+            # Commit the full rotation to the escape heading in one bounded
+            # call.  An incremental turn passes back through the
+            # obstacle-facing yaw, which re-triggers this front-block handler
+            # mid-rotation -> a new scan, a new heading, another partial turn:
+            # the drone spin-locks in place and never escapes.  yaw_to_fast
+            # sends yaw-only commands (no translation) so it is safe next to
+            # the obstacle; once aligned the obstacle is out of the forward
+            # sector and the drone can translate away.
+            await self.yaw_to_fast(yaw, timeout_s=2.5, tolerance_deg=15.0)
             p = self.pose() or pose
             d = self.depth.get_frame() if self.depth.get_frame() is not None else depth_frame
-            print(f"[FRONT_BLOCK] side/branch bypass selected yaw={yaw:.0f}; not backtracking")
             await self.drive_centerline_step(p, d, reason="front_block_bypass")
             self.front_block_count = 0
             return
@@ -3265,8 +3456,15 @@ class QualifierMission:
                 self.front_block_count = 0
                 return
 
-        # Second preference: go above/below it, bounded by max/min altitude.
-        if await self.vertical_escape(reason=reason):
+        # Second preference: go above/below it.  DISABLED by default: the drone
+        # has only a forward-facing depth camera, no up/down sensor, so a blind
+        # climb into a covered path or low ceiling crashes the drone.  Treat the
+        # blocked front as a dead end and backtrack instead.
+        if bool(getattr(self.args, "vertical_escape_enabled", False)):
+            if await self.vertical_escape(reason=reason):
+                self.front_block_count = 0
+                return
+        elif await self.start_dead_end_escape(pose, reason=f"{reason}_no_bypass"):
             self.front_block_count = 0
             return
 
@@ -3475,10 +3673,14 @@ class QualifierMission:
                 f"safe=({safe_vn:.2f},{safe_ve:.2f}) L={avoid_info.get('left',0):.2f} C={avoid_info.get('center',0):.2f} R={avoid_info.get('right',0):.2f} "
                 f"corridor={avoid_info.get('corridor',0):.2f} count={avoid_info.get('corridor_count',0)}"
             )
-        if avoid_info.get("emergency") or safe_speed < float(getattr(self.args, "min_progress_speed_m_s", 0.06)):
+        if (
+            avoid_info.get("emergency")
+            or safe_speed < float(getattr(self.args, "min_progress_speed_m_s", 0.06))
+            or self._progress_choked(desired_vn, desired_ve, safe_vn, safe_ve)
+        ):
             self.local_soft_block_count += 1
-            if self.local_soft_block_count >= int(getattr(self.args, "local_block_scan_limit", 4)):
-                print(f"[CENTERLINE] movement blocked {self.local_soft_block_count} times; rescanning")
+            if self.local_soft_block_count >= int(getattr(self.args, "obstacle_stall_ticks", 2)):
+                print(f"[CENTERLINE] forward progress choked by obstacle (safe={safe_speed:.2f}) x{self.local_soft_block_count}; rescanning immediately")
                 self.local_soft_block_count = 0
                 self.local_corridor_yaw = None
                 await self.scan_viable_pathways(reason="centerline_avoid_blocked")
@@ -3762,10 +3964,81 @@ class QualifierMission:
         self.current_path = []
         self.last_plan_ms = 0
 
-    def need_replan(self) -> bool:
+    def _progress_choked(self, desired_vn: float, desired_ve: float, safe_vn: float, safe_ve: float) -> bool:
+        """True when the obstacle-avoidance filter has throttled forward motion
+        down to a near-stall.
+
+        The old stall test only fired when the safe speed fell below
+        min_progress_speed_m_s (~0.06 m/s).  An obstacle right in the planned
+        path typically leaves the drone creeping at 0.1-0.15 m/s -- above that
+        floor -- so the drone would hover and inch forward indefinitely instead
+        of replanning.  This treats motion as choked when the safe speed is
+        both slow in absolute terms AND a small fraction of what the controller
+        asked for, so a real obstacle triggers an immediate replan while an
+        intentional slow squeeze does not.
+        """
+        desired = math.hypot(desired_vn, desired_ve)
+        safe = math.hypot(safe_vn, safe_ve)
+        floor = float(getattr(self.args, "obstacle_stall_speed_m_s", 0.22))
+        frac = float(getattr(self.args, "obstacle_stall_fraction", 0.4))
+        if safe >= floor:
+            return False
+        return desired <= 1e-3 or safe < frac * desired
+
+    def _extend_path_past_frontier(self, path: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        """Push the final waypoint a little past the frontier into unknown space.
+
+        A frontier sits on the edge of the known map.  Stopping exactly on it
+        means the drone scans from a spot it has already mapped, producing
+        duplicate views.  Extending the last segment by a fixed overshoot puts
+        the drone just inside genuinely new territory before the next scan, so
+        each scan covers fresh area and the drone covers more ground per leg.
+        The depth-camera safety filter still runs every tick, so overshooting
+        toward an unmapped obstacle is caught reactively.
+        """
+        overshoot = float(getattr(self.args, "frontier_overshoot_m", 1.5))
+        if overshoot <= 0.0 or len(path) < 2:
+            return path
+        n1, e1 = path[-1]
+        n0, e0 = path[-2]
+        dn, de = n1 - n0, e1 - e0
+        norm = math.hypot(dn, de)
+        if norm < 1e-3:
+            return path
+        ext = (n1 + overshoot * dn / norm, e1 + overshoot * de / norm)
+        if self.mapper.path_segment_collision_free(
+            (n1, e1), ext,
+            inflation_extra_m=self.args.path_extra_inflation_m,
+            ignore_start_m=0.0,
+        ):
+            return list(path) + [ext]
+        return path
+
+    def need_replan(self, pose: Optional[Dict[str, float]] = None) -> bool:
+        # No live path -> must plan.
         if not self.current_path:
             return True
-        return now_ms() - self.last_plan_ms >= int(self.args.replan_interval_s * 1000)
+        # Path commitment (node/edge model): a planned path is a node; the
+        # distance flown along it is the edge weight.  Keep following a valid
+        # path instead of rebuilding it every replan-interval tick (the churn
+        # that left path=0 most of the mission).  Force a replan only when the
+        # path is nearly consumed (upper bound -- do not overcommit to a stale
+        # goal) or when both the interval AND a minimum travel since the last
+        # plan have elapsed (lower bound -- no per-tick path thrash).
+        min_waypoints = int(getattr(self.args, "path_replan_min_waypoints", 2))
+        if len(self.current_path) <= min_waypoints:
+            return True
+        if now_ms() - self.last_plan_ms < int(self.args.replan_interval_s * 1000):
+            return False
+        min_travel = float(getattr(self.args, "path_replan_min_travel_m", 1.0))
+        if min_travel > 0.0 and pose is not None and self.last_plan_ne is not None:
+            moved = math.hypot(
+                pose["north"] - self.last_plan_ne[0],
+                pose["east"] - self.last_plan_ne[1],
+            )
+            if moved < min_travel:
+                return False
+        return True
 
     def replan(self, pose: Dict[str, float]) -> None:
         rejected = self.active_rejected_frontiers()
@@ -3800,22 +4073,28 @@ class QualifierMission:
                 turnback_penalty_weight=float(getattr(self.args, "turnback_penalty", 5.0)),
             )
             if path:
-                print("[PLAN] fallback reused recent path; consider leaving --allow-recent-path-fallback disabled")
+                print("[PLAN] no non-backtracking frontier; using recent-path-penalised route to keep moving")
 
         self.last_plan_ms = now_ms()
         if path:
+            path = self._extend_path_past_frontier(path)
             self.current_path = path
+            self.last_plan_ne = (pose["north"], pose["east"])
             goal = path[-1]
             print(f"[PLAN] path_len={len(path)} goal N={goal[0]:.1f} E={goal[1]:.1f} known_cells={len(self.mapper.logodds)} rejected={len(rejected)} recent_cells={len(recent_cells)}")
         else:
             self.current_path = []
+            self.last_plan_ne = None
             print(f"[PLAN] no non-backtracking frontier; known_cells={len(self.mapper.logodds)} rejected={len(rejected)} recent_cells={len(recent_cells)}")
 
     async def drive_path_step(self, pose: Dict[str, float], depth_frame: Optional[np.ndarray]) -> None:
         left, center, right = self.clearances(depth_frame)
         self.update_travel_history(pose)
+        mission_elapsed_s = time.monotonic() - getattr(self, "mission_start_monotonic", time.monotonic())
+        mission_remaining_s = max(0.0, float(self.args.duration_s) - mission_elapsed_s)
         print(
-            f"[NAV] N={pose['north']:.1f} E={pose['east']:.1f} yaw={pose['yaw_deg']:.0f} "
+            f"[NAV] t={mission_elapsed_s:.0f}s/{self.args.duration_s:.0f}s rem={mission_remaining_s:.0f}s "
+            f"N={pose['north']:.1f} E={pose['east']:.1f} yaw={pose['yaw_deg']:.0f} "
             f"L={left:.2f} C={center:.2f} R={right:.2f} path={len(self.current_path)} saved={self.logger.saved_count}"
         )
 
@@ -3854,6 +4133,27 @@ class QualifierMission:
             # trigger a vertical escape much later.
             self.front_block_count = max(0, self.front_block_count - 1)
 
+        # Corner-clip guard.  The drone is not a point: rotating while one side
+        # is very close to a wall sweeps a prop into it (this caused a crash).
+        # If one side is critically close AND the other side has clear room,
+        # edge straight away from the close wall first -- pure lateral motion,
+        # no yaw change -- before any heading decision runs.  Only fires when
+        # the drone is lopsided in its corridor, so it does not stall the drone
+        # in a uniformly narrow passage.
+        clip_margin = float(getattr(self.args, "side_clip_margin_m", 0.65))
+        if center > self.args.emergency_stop_m and min(left, right) < clip_margin:
+            push = 0.0
+            if right < clip_margin and left > clip_margin + 0.4:
+                push = -float(getattr(self.args, "side_clip_push_m_s", 0.25))   # edge to vehicle left
+            elif left < clip_margin and right > clip_margin + 0.4:
+                push = float(getattr(self.args, "side_clip_push_m_s", 0.25))    # edge to vehicle right
+            if push != 0.0:
+                vn, ve = body_to_ned(0.0, push, pose["yaw_deg"])
+                safe_vn, safe_ve, _ = self.safety.filter_velocity_ned(vn, ve, pose, depth_frame)
+                await self.drone.send_velocity(safe_vn, safe_ve, 0.0, pose["yaw_deg"])
+                print(f"[CLIP_GUARD] side wall close L={left:.2f} R={right:.2f}; edging away (no rotation)")
+                return
+
         # v38: if we are looping inside a room/zone, pause the perimeter-following
         # behaviour and deliberately scan for a gateway into unknown space.
         if self.zone_loop_detected(pose) and now_ms() - self.last_zone_escape_ms > int(float(getattr(self.args, "zone_loop_cooldown_s", 18.0)) * 1000):
@@ -3869,26 +4169,51 @@ class QualifierMission:
         # while moving, branch into it before the global frontier planner can pull the
         # drone into another loop around the current room.  This is a cheap check; the
         # more expensive yaw scans are only used at junctions, dead ends, or loops.
-        if bool(getattr(self.args, "topological_gateway_mode", True)):
+        # Skip the opportunistic side-opening grab while a committed global
+        # frontier path exists.  The planner already heads to unexplored space;
+        # letting the reactive side-opening selector re-pick a heading every
+        # ~1.2 s overrides the planned route and the drone oscillates back and
+        # forth over the same section instead of following the path out.
+        committed_global_path = len(self.current_path) > int(getattr(self.args, "path_replan_min_waypoints", 2))
+        if bool(getattr(self.args, "topological_gateway_mode", True)) and not committed_global_path:
             if now_ms() - self.last_gateway_scan_ms > int(float(getattr(self.args, "topo_side_check_gap_s", 1.2)) * 1000):
                 if await self.maybe_take_side_opening(pose, left, center, right, reason="topo_side_gateway"):
                     self.last_gateway_scan_ms = now_ms()
                     return
 
         # v29: high-speed corridor behaviour.  If a straight corridor is visible,
-        # align to its centreline and drive it directly.  This is much faster than
-        # repeatedly choosing short frontier waypoints inside the same corridor.
-        if bool(getattr(self.args, "express_corridor_mode", True)):
+        # align to its centreline and drive it directly.
+        # The global frontier planner is the single authoritative decision-maker
+        # whenever it has a committed path.  The express-corridor layer is a
+        # reactive heading-picker; letting it run alongside a planned path means
+        # two layers fight over the heading and the drone hovers/oscillates at
+        # corners.  Run it only as a fallback when there is no global path.
+        if bool(getattr(self.args, "express_corridor_mode", True)) and not committed_global_path:
             moved_express = await self.drive_express_corridor_step(pose, depth_frame, reason="nav")
             if moved_express:
                 return
 
-        # v24: after a quick scan has selected a clear centreline, actually use it
-        # for a short committed interval instead of immediately falling back into
-        # repeated global replanning. This is what lets the drone leave the start
-        # area quickly while still using the accurate occupancy mapper.
+        # v39 keep the global frontier path warm even while the reactive
+        # centreline layer is driving below.  Previously replan() only ran
+        # after the committed-centreline block returned, so a committed
+        # corridor starved the planner and current_path stayed empty for most
+        # of the mission (path=0).  need_replan() now applies path commitment,
+        # so this is a cheap no-op on most ticks.
+        if self.need_replan(pose):
+            self.replan(pose)
+
+        # Recompute after the warm replan: the planner may have just produced or
+        # consumed a path.  When a committed global path exists the planner is
+        # authoritative -- skip the reactive committed-centreline layer too, so
+        # only the planned route drives the drone.
+        committed_global_path = len(self.current_path) > int(getattr(self.args, "path_replan_min_waypoints", 2))
+
+        # v24: after a quick scan has selected a clear centreline, drive it for a
+        # short committed interval.  Fallback only -- skipped while a global path
+        # exists so it cannot override the planned route.
         if (
             bool(getattr(self.args, "prefer_committed_centerline", True))
+            and not committed_global_path
             and self.local_corridor_yaw is not None
             and now_ms() < self.local_corridor_until_ms
         ):
@@ -3896,7 +4221,7 @@ class QualifierMission:
             if moved:
                 return
 
-        if self.need_replan():
+        if self.need_replan(pose):
             self.replan(pose)
 
         if not self.current_path:
@@ -3963,7 +4288,8 @@ class QualifierMission:
 
             self.segment_block_count += 1
             reject_target = self.current_path[-1] if self.current_path else target
-            self.reject_frontier_world(reject_target, reason="blocked_first_segment")
+            self.reject_frontier_world(reject_target, reason="blocked_first_segment",
+                                       radius_m=float(getattr(self.args, "blocked_reject_radius_m", 1.0)))
             print(f"[NAV] next path segment intersects inflated obstacle; replanning/stuck_count={self.segment_block_count}")
             self.current_path = []
             await self.stop_motion(0.1)
@@ -4037,10 +4363,14 @@ class QualifierMission:
                     self.avoid_block_count = 0
                     await self.recovery_scan("avoidance_blocked_path")
                     return
-            elif safe_speed < float(getattr(self.args, "min_progress_speed_m_s", 0.06)) and bool(getattr(self.args, "local_centerline_mode", True)):
+            elif (
+                (safe_speed < float(getattr(self.args, "min_progress_speed_m_s", 0.06))
+                 or self._progress_choked(desired_vn, desired_ve, safe_vn, safe_ve))
+                and bool(getattr(self.args, "local_centerline_mode", True))
+            ):
                 self.local_soft_block_count += 1
-                print(f"[CENTERLINE] global path command slowed to zero count={self.local_soft_block_count}; switching to local centreline")
-                if self.local_soft_block_count >= int(getattr(self.args, "local_block_scan_limit", 3)):
+                print(f"[NAV] global path choked by obstacle (safe={safe_speed:.2f}) count={self.local_soft_block_count}; replanning immediately")
+                if self.local_soft_block_count >= int(getattr(self.args, "obstacle_stall_ticks", 2)):
                     self.current_path = []
                     self.local_soft_block_count = 0
                     await self.scan_viable_pathways(reason="global_corridor_slowdown")
@@ -4095,7 +4425,20 @@ class QualifierMission:
         except TypeError:
             await self.drone.arm_and_takeoff()
 
+    def _setup_file_logging(self) -> None:
+        """Mirror all stdout/stderr (every print, every traceback) into a log file."""
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            log_path = self.output_dir / "mission_log.txt"
+            self._log_fh = open(log_path, "a", buffering=1, encoding="utf-8")
+            sys.stdout = _Tee(sys.__stdout__, self._log_fh)
+            sys.stderr = _Tee(sys.__stderr__, self._log_fh)
+            print(f"[LOG] capturing full mission log -> {log_path}")
+        except Exception as exc:
+            print(f"[WARN] could not open mission log file: {exc}")
+
     async def run(self) -> None:
+        self._setup_file_logging()
         print(f"[MISSION] mode={self.args.mode} output_dir={self.output_dir}")
         print("[MISSION] Connecting...")
         await self.drone.connect()
@@ -4131,6 +4474,7 @@ class QualifierMission:
             print("[MISSION] startup scan skipped")
 
         start_time = time.monotonic()
+        self.mission_start_monotonic = start_time
         try:
             while True:
                 elapsed = time.monotonic() - start_time
@@ -4217,11 +4561,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--depth-topic", default=DEFAULT_DEPTH_TOPIC)
 
     # Mission and control timing.
-    p.add_argument("--duration-s", type=float, default=900.0)
+    p.add_argument("--duration-s", type=float, default=600.0, help="Mission flight-time cap in seconds. Drone lands when reached.")
+    p.add_argument("--fast-grid-decision", action=argparse.BooleanOptionalAction, default=True, help="Evaluate candidate route headings from the occupancy grid instead of physically yawing to depth-snapshot each one. Much faster route decisions when the map is already built.")
     p.add_argument("--takeoff-altitude-m", type=float, default=3.0, help="Target takeoff altitude in metres above the start point. Use 2.5 or 3.0 for this map.")
     p.add_argument("--max-flying-height-m", type=float, default=7.0, help="Maximum allowed flight altitude above takeoff point for vertical obstacle avoidance")
     p.add_argument("--min-flying-height-m", type=float, default=2.2, help="Minimum allowed flight altitude above takeoff point for vertical obstacle avoidance")
     p.add_argument("--enable-vertical-avoidance", action=argparse.BooleanOptionalAction, default=True, help="When a real front obstacle blocks progress, try climbing/descending within min/max height before giving up")
+    p.add_argument("--vertical-escape-enabled", action=argparse.BooleanOptionalAction, default=False,
+                   help="Allow climb/descend to escape a blocked front. OFF by default: no up/down sensor, so a blind climb into a ceiling crashes the drone")
     p.add_argument("--vertical-escape-step-m", type=float, default=1.0, help="Altitude step used when trying to climb over or descend under an obstacle")
     p.add_argument("--vertical-speed-m-s", type=float, default=0.35, help="Vertical speed used for obstacle escape; NED sign is handled internally")
     p.add_argument("--vertical-clearance-target-m", type=float, default=2.2, help="Required center clearance after changing altitude before committing forward")
@@ -4242,7 +4589,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # Occupancy grid / frontier planning.
     p.add_argument("--grid-resolution-m", type=float, default=0.40)
     p.add_argument("--map-ray-max-m", type=float, default=8.0)
-    p.add_argument("--map-safety-radius-m", type=float, default=0.85)
+    p.add_argument("--map-safety-radius-m", type=float, default=0.40,
+                   help="A* costmap inflation radius. At 0.85m (grid res 0.40m) inflation was 3 cells (~1.2m), which sealed every doorway narrower than ~2.4m so the planner could never route out of a room. 0.40m = 1-cell inflation, keeps doorways >0.8m passable; the reactive depth-camera safety corridor (collision-radius-m) is the real-time collision guard.")
     p.add_argument("--map-sample-cols", type=int, default=104)
     p.add_argument("--map-occ-threshold", type=int, default=4, help="Log-odds threshold before a cell is treated as occupied; higher reduces ghost walls")
     p.add_argument("--map-occ-update", type=int, default=2, help="Log-odds increment for one obstacle observation")
@@ -4268,7 +4616,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--map-regularize-clean-display", action=argparse.BooleanOptionalAction, default=True, help="Show raw occupied evidence as grey and accepted regularized primitives as black in occupancy_grid.png")
     p.add_argument("--no-diagonal-corner-cutting", action=argparse.BooleanOptionalAction, default=True, help="Prevent A* from using diagonal moves through blocked cell corners")
     p.add_argument("--replan-interval-s", type=float, default=0.65)
-    p.add_argument("--min-frontier-dist-m", type=float, default=2.4)
+    # v39 path commitment. Edge weight = distance flown along the planned path.
+    p.add_argument("--path-replan-min-travel-m", type=float, default=1.0,
+                   help="Lower bound on edge weight: min metres flown along a planned path before the replan interval is allowed to rebuild it")
+    p.add_argument("--path-replan-min-waypoints", type=int, default=2,
+                   help="Upper bound: force a replan once the live path has this many or fewer waypoints left (do not overcommit to a stale goal)")
+    p.add_argument("--min-frontier-dist-m", type=float, default=3.5,
+                   help="Minimum distance to a frontier goal; larger -> longer legs, fewer stop-and-scan cycles")
+    p.add_argument("--frontier-overshoot-m", type=float, default=1.5,
+                   help="Extend the planned path this far past the frontier into unknown space so the drone scans from genuinely new territory")
     p.add_argument("--max-frontiers-to-try", type=int, default=90)
     p.add_argument("--frontier-unknown-radius-m", type=float, default=3.0, help="v38: radius around a frontier used to estimate information gain / doorway quality")
     p.add_argument("--frontier-unknown-lookahead-m", type=float, default=7.0, help="v38: unknown-space lookahead beyond a frontier")
@@ -4325,6 +4681,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--path-extra-inflation-m", type=float, default=0.0, help="Extra inflation when checking next path segment")
     p.add_argument("--path-ignore-start-m", type=float, default=1.45, help="Ignore this much of the path segment near the current pose during inflated-obstacle checks")
     p.add_argument("--reject-frontier-ttl-s", type=float, default=20.0, help="How long to avoid a frontier that repeatedly caused a blocked segment")
+    p.add_argument("--blocked-reject-radius-m", type=float, default=1.0,
+                   help="When a path's first segment is blocked, reject this radius of frontier cells (not one) so the planner stops re-picking the same unreachable patch")
     p.add_argument("--stuck-replan-limit", type=int, default=3, help="Blocked-segment replans before active yaw recovery")
     p.add_argument("--no-path-recovery-limit", type=int, default=2, help="No-path loops before active yaw recovery")
     p.add_argument("--recovery-scan-gap-s", type=float, default=4.0)
@@ -4338,6 +4696,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--turn-first-angle-deg", type=float, default=45.0, help="Yaw in place before translating if waypoint heading differs by more than this. This avoids diagonal/sideways motion with a forward-facing depth camera.")
 
     # Reactive avoidance. These wrap the organiser AvoidancePlanner.py / avoid.py logic.
+    p.add_argument("--side-clip-margin-m", type=float, default=0.65,
+                   help="If one side clearance is below this (and the other side is open), edge away before any rotation -- prevents a prop clipping a wall corner")
+    p.add_argument("--side-clip-push-m-s", type=float, default=0.25,
+                   help="Lateral speed used by the corner-clip guard to edge away from a close wall")
     p.add_argument("--avoid-safe-m", type=float, default=2.0, help="Start slowing/blending inside this front/corridor distance")
     p.add_argument("--avoid-critical-m", type=float, default=1.20, help="Critical distance used by the reactive safety filter")
     p.add_argument("--side-critical-m", type=float, default=0.78, help="Cancel motion toward side obstacles inside this distance")
@@ -4436,12 +4798,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--side-opening-min-unknown-cells", type=int, default=14)
     p.add_argument("--side-opening-visited-weight", type=float, default=10.0)
     p.add_argument("--side-opening-commit-s", type=float, default=14.0)
+    # v39 branch commitment + hysteresis. Edge weight = distance between commits.
+    p.add_argument("--branch-min-travel-m", type=float, default=1.5,
+                   help="Lower bound on edge weight: min metres to travel on a committed branch before a different side opening may steal it")
+    p.add_argument("--branch-min-interval-s", type=float, default=3.0,
+                   help="Lower bound (time): min seconds on a committed branch before a different side opening may steal it")
+    p.add_argument("--branch-switch-margin", type=float, default=1.25,
+                   help="Hysteresis: a different-heading candidate must beat the committed branch score by this factor to switch")
+    p.add_argument("--branch-realign-deg", type=float, default=35.0,
+                   help="Candidate headings within this many degrees of the committed branch count as the same heading (refresh, not a switch)")
     p.add_argument("--side-opening-yaw-timeout-s", type=float, default=1.0)
     p.add_argument("--side-opening-yaw-tolerance-deg", type=float, default=28.0)
     p.add_argument("--express-corridor-slow-center-m", type=float, default=2.3)
     p.add_argument("--express-corridor-fast-center-m", type=float, default=4.0)
     p.add_argument("--express-corridor-slow-side-m", type=float, default=0.80)
     p.add_argument("--min-progress-speed-m-s", type=float, default=0.06)
+    # v39 obstacle-stall detection: an obstacle in the planned path leaves the
+    # drone creeping above min-progress-speed but well below what it asked for.
+    p.add_argument("--obstacle-stall-speed-m-s", type=float, default=0.22,
+                   help="Safe speed below this (and below the stall fraction of desired) counts as choked by an obstacle -> immediate replan")
+    p.add_argument("--obstacle-stall-fraction", type=float, default=0.4,
+                   help="Motion is choked when safe speed drops below this fraction of the desired speed")
+    p.add_argument("--obstacle-stall-ticks", type=int, default=2,
+                   help="Consecutive choked ticks before the drone abandons the path and replans (small -> reacts fast)")
     p.add_argument("--waypoint-record-every-m", type=float, default=0.65)
     p.add_argument("--corridor-allow-crawl", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--corridor-min-scale-always", type=float, default=0.25)
@@ -4453,15 +4832,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--dead-end-front-m", type=float, default=1.75, help="Center clearance below this can be considered a dead-end front wall")
     p.add_argument("--dead-end-side-open-m", type=float, default=2.15, help="If either side is more open than this, treat the blockage as bypassable rather than a dead end")
     p.add_argument("--dead-end-backtrack-min-m", type=float, default=2.8)
-    p.add_argument("--dead-end-backtrack-max-m", type=float, default=8.0)
+    p.add_argument("--dead-end-backtrack-max-m", type=float, default=4.5,
+                   help="Retreat at most this far on a dead-end backtrack before rescanning (small -> drone does not trudge home)")
     p.add_argument("--dead-end-backtrack-spacing-m", type=float, default=1.8)
-    p.add_argument("--dead-end-backtrack-max-targets", type=int, default=4)
+    p.add_argument("--dead-end-backtrack-max-targets", type=int, default=2,
+                   help="Max breadcrumb targets in one backtrack chain; small -> retreat just clear of the tight spot, then rescan")
     p.add_argument("--dead-end-backtrack-speed-m-s", type=float, default=0.66)
-    p.add_argument("--dead-end-backtrack-timeout-s", type=float, default=10.0)
+    p.add_argument("--dead-end-backtrack-timeout-s", type=float, default=6.0)
+    p.add_argument("--dead-end-prefer-frontier", action=argparse.BooleanOptionalAction, default=True,
+                   help="On a dead-end, route to a reachable unexplored frontier instead of backtracking toward the origin")
     p.add_argument("--dead-end-backtrack-waypoint-radius-m", type=float, default=0.75)
     p.add_argument("--dead-end-turn-first-angle-deg", type=float, default=35.0)
     p.add_argument("--avoid-recent-path", action=argparse.BooleanOptionalAction, default=True, help="Normal exploration avoids reusing the recent breadcrumb trail; dead-end escape may still backtrack explicitly")
-    p.add_argument("--allow-recent-path-fallback", action=argparse.BooleanOptionalAction, default=False, help="Allow global frontier planner to reuse recent path when no fresh route is found. Keep disabled for competition exploration.")
+    p.add_argument("--allow-recent-path-fallback", action=argparse.BooleanOptionalAction, default=True, help="When no non-backtracking frontier exists, let the planner return a recent-path-penalised route instead of no path at all. ON by default: without it the planner returns nothing near already-crossed areas and the drone zig-zags reactively.")
     p.add_argument("--recent-path-lookback-m", type=float, default=18.0, help="Length of recent breadcrumb trail to avoid during normal exploration")
     p.add_argument("--recent-path-radius-m", type=float, default=0.90, help="Radius around recent breadcrumbs considered already travelled")
     p.add_argument("--recent-path-exclude-current-m", type=float, default=1.8, help="Do not treat cells close to current pose as backtracking")
