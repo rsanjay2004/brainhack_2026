@@ -68,6 +68,8 @@ These packages are used for:
 | `opencv-python` | RGB image handling, annotation drawing, colour checking, and image saving. |
 | `mavsdk` | Communicating with the PX4 drone and sending takeoff/offboard velocity commands. |
 | `ultralytics` | Loading and running the YOLO model for barrel detection. |
+| 'gz.transport' | Primarily designed for robotics applications and is the core messaging system for the Gazebo robot simulator. | sudo apt install libgz-transport13-dev
+| 'gz.mesgs10' | Standard Data Validation | sudo apt install libgz-msgs
 
 ### Gazebo / GZ Python bindings
 
