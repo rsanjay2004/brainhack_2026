@@ -36,18 +36,6 @@ After YOLO training:
 
 Or, if you already unzipped the model:
     python3 qualifier_main_v38.py --mode count --model train/weights/best.pt --duration-s 300
-
-SCRIPT TO RUN THIS FILE:
-python3 qualifier_main_v43.py --mode count \
-  --model models/barrel_best.pt \
-  --duration-s 300 \
-  --no-land \
-  --takeoff-altitude-m 3.2 \
-  --max-flying-height-m 7.0 \
-  --conf 0.35 \
-  --merge-radius-m 0.70 \
-  --duplicate-suppression-radius-m 1.10 \
-  --min-track-hits 2
 """
 
 from __future__ import annotations
